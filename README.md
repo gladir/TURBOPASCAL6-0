@@ -3,7 +3,7 @@ Clone des commandes du Turbo Pascal 6
 
 <h2>Liste des fichiers</h2>
 
-Voici la liste des différents fichiers proposés dans Corail :
+Voici la liste des différents fichiers proposés dans TURBOPASCAL6-0 :
 
 <table>
 		<tr>
