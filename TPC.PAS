@@ -8,6 +8,8 @@ program TPC;
   Cible: DOS MZ, instructions 8086, un segment CS/DS et pile separee.
   Restrictions explicites: pas de linker TPU/OBJ, real, tableaux, objets,
   types utilisateurs, procedures a parametres, routines imbriquees, ASM.
+  /B recompile recursivement les sources d'unites dans l'image EXE, sans
+  produire de TPU9. Les TPU sans source restent non liables.
   Les fonctionnalites manquantes ont un diagnostic propre sans faux numero TP.
   Numeros verifies dans le source et dans la table du TPC.EXE original DISK1.
   Les messages anglais ci-dessous couvrent les erreurs utilisees ici; les
@@ -27,6 +29,7 @@ const
   MaxSymbols = 512;
   MaxFixups = 4096;
   MaxDefines = 128;
+  MaxUnits = 64;
   tkEOF=0; tkIdent=1; tkConstant=2;
   tkPlus=3; tkMinus=4; tkTimes=5; tkSlash=6; tkEqual=7;
   tkNE=8; tkGreater=9; tkLess=10; tkGE=11; tkLE=12;
@@ -76,11 +79,41 @@ type
     Kind, Typ, Width: Byte;
     Capacity: Byte;
     Addr: Word;
+    Owner: Byte;
+    Exported, HasBody: Boolean;
+    ForwardJump: Word;
     Value: Longint;
     StrValue: TShortString;
   end;
   TAddressFixup = record Position, DataOffset: Word end;
   TCondition = record ParentActive, Test, SeenElse: Boolean end;
+  TUnitSet = set of 0..MaxUnits;
+  TBuildUnit = record
+    Name: string[63];
+    State: Byte; { 1 = compilation en cours; 2 = compilee }
+    InterfaceReady, HasInit: Boolean;
+    InitAddress: Word;
+  end;
+  TSourceBuffer = array[1..MaxSource] of Char;
+  PSourceBuffer = ^TSourceBuffer;
+  PParserState = ^TParserState;
+  TParserState = record
+    Buffer: PSourceBuffer;
+    SourceName: TShortString;
+    SourceSize, SourcePos: Longint;
+    Line, Column, TokenLine, TokenColumn: Word;
+    Token: Byte;
+    TokenText: TShortString;
+    TokenValue: Longint;
+    TokenIsString, Active, InProcedure, InInterface: Boolean;
+    CondDepth, CurrentUnit: Byte;
+    Imports: TUnitSet;
+    ImportOrder: array[1..MaxUnits] of Byte;
+    ImportCount: Byte;
+    Conditions: array[1..32] of TCondition;
+    Defines: array[1..MaxDefines] of string[63];
+    DefineCount, OptionBits, StackSize, MinHeap, MaxHeap: Word;
+  end;
 
 var
   Source: array[1..MaxSource] of Char;
@@ -103,6 +136,16 @@ var
   EntryFixup, RuntimeString, RuntimeInteger, RuntimeChar: Word;
   RuntimeBoolean, RuntimeCopy: Word;
   NumberBuffer, TrueText, FalseText: Word;
+  Units: array[1..MaxUnits] of TBuildUnit;
+  InitOrder: array[1..MaxUnits] of Byte;
+  UnitCount, InitCount, CurrentUnit: Byte;
+  Imports: TUnitSet;
+  ImportOrder: array[1..MaxUnits] of Byte;
+  ImportCount: Byte;
+  InInterface: Boolean;
+  MainSourceName: TShortString;
+  InitialDefines: array[1..MaxDefines] of string[63];
+  InitialDefineCount, InitialOptions: Word;
 
 function Upper(S: TShortString): TShortString;
 var I: Integer;
@@ -147,7 +190,10 @@ begin
     55:ErrorMessage:='INTERFACE expected';
     57:ErrorMessage:='THEN expected';
     58:ErrorMessage:='TO or DOWNTO expected';
+    59:ErrorMessage:='Undefined forward';
     66:ErrorMessage:='String expression expected';
+    68:ErrorMessage:='Circular unit reference';
+    69:ErrorMessage:='Unit name mismatch';
     72:ErrorMessage:='Unit file format error';
     73:ErrorMessage:='IMPLEMENTATION expected';
     76:ErrorMessage:='Constant out of range';
@@ -528,18 +574,78 @@ begin
   StoreString:=A;
 end;
 
-function FindSymbol(S: TShortString): Word;
+function FindOwnSymbol(S: TShortString): Word;
 var I: Word;
 begin
+  FindOwnSymbol:=0;
+  for I:=1 to SymbolCount do
+    if (Symbols[I].Name=S) and (Symbols[I].Owner=CurrentUnit) then
+      FindOwnSymbol:=I;
+end;
+
+function FindSymbol(S: TShortString): Word;
+var I: Word; J: Integer;
+begin
+  I:=FindOwnSymbol(S);
+  if I<>0 then begin FindSymbol:=I; Exit end;
   FindSymbol:=0;
-  for I:=1 to SymbolCount do if Symbols[I].Name=S then FindSymbol:=I;
+  for J:=ImportCount downto 1 do
+    for I:=1 to SymbolCount do
+      if (Symbols[I].Name=S) and Symbols[I].Exported and
+        (Symbols[I].Owner=ImportOrder[J]) then begin FindSymbol:=I; Exit end;
+end;
+
+procedure AddImport(U: Byte);
+var I, J: Byte;
+begin
+  { Ne pas reconstruire une unite deja compilee; sa priorite de recherche
+    depend de la clause uses courante et non de l'ordre de compilation. }
+  for I:=1 to ImportCount do if ImportOrder[I]=U then begin
+    for J:=I to ImportCount-1 do ImportOrder[J]:=ImportOrder[J+1];
+    Dec(ImportCount); Break;
+  end;
+  Inc(ImportCount); ImportOrder[ImportCount]:=U;
+  Imports:=Imports+[U];
+end;
+
+function FindBuildUnit(S: TShortString): Byte;
+var I: Byte;
+begin
+  FindBuildUnit:=0;
+  for I:=1 to UnitCount do if Units[I].Name=S then FindBuildUnit:=I;
+end;
+
+{ Le premier identificateur est deja consomme. Gere Unite.Symbole sans
+  rendre accessibles les symboles prives ou les dependances transitives. }
+function ResolveSymbol(Name: TShortString): Word;
+var U: Byte; I: Word;
+begin
+  if Token<>tkDot then begin
+    I:=FindSymbol(Name);
+    if I=0 then Fail(3,'Identificateur inconnu: '+Name);
+    ResolveSymbol:=I; Exit;
+  end;
+  U:=FindBuildUnit(Name);
+  if (U=0) or not ((U in Imports) or (U=CurrentUnit)) then
+    Fail(3,'Unite inconnue: '+Name);
+  NextToken;
+  if Token<>tkIdent then Fail(2,'Identificateur qualifie attendu');
+  I:=0;
+  for I:=1 to SymbolCount do
+    if (Symbols[I].Owner=U) and (Symbols[I].Name=TokenText) and
+      (Symbols[I].Exported or (U=CurrentUnit)) then begin
+      ResolveSymbol:=I; NextToken; Exit;
+    end;
+  Fail(3,'Identificateur inconnu: '+Name+'.'+TokenText);
 end;
 
 function NewSymbol(S: TShortString): Word;
 begin
-  if FindSymbol(S)<>0 then Fail(4,'Identificateur duplique: '+S);
+  if FindOwnSymbol(S)<>0 then Fail(4,'Identificateur duplique: '+S);
   if SymbolCount=MaxSymbols then Fail(123,'Table des symboles pleine');
   Inc(SymbolCount); FillChar(Symbols[SymbolCount],SizeOf(TSymbol),0);
+  Symbols[SymbolCount].Owner:=CurrentUnit;
+  Symbols[SymbolCount].Exported:=InInterface;
   Symbols[SymbolCount].Name:=S; NewSymbol:=SymbolCount;
 end;
 
@@ -594,10 +700,10 @@ begin
     else begin RequireInteger(T); Emit2($F7,$D0) end;
   end else if Token=tkIdent then begin
     Name:=TokenText; NextToken;
-    if (Name='TRUE') or (Name='FALSE') then begin
+    if (Token<>tkDot) and ((Name='TRUE') or (Name='FALSE')) then begin
       T:=ttBoolean; if Name='TRUE' then LoadImmediate(1) else LoadImmediate(0);
-    end else if (Name='LENGTH') or (Name='ORD') or (Name='CHR') or
-      (Name='ABS') or (Name='SQR') or (Name='SUCC') or (Name='PRED') then begin
+    end else if (Token<>tkDot) and ((Name='LENGTH') or (Name='ORD') or (Name='CHR') or
+      (Name='ABS') or (Name='SQR') or (Name='SUCC') or (Name='PRED')) then begin
       Need(tkLP); T:=Expression; Need(tkRP);
       if Name='LENGTH' then begin
         if T=ttString then begin Emit2($89,$C3); Emit2($8A,$07); Emit2($30,$E4) end
@@ -615,7 +721,7 @@ begin
         if Name='PRED' then Emit($48);
       end;
     end else begin
-      I:=FindSymbol(Name); if I=0 then Fail(3,'Identificateur inconnu: '+Name);
+      I:=ResolveSymbol(Name);
       if Symbols[I].Kind=skProc then Unsupported('fonction: '+Name);
       T:=Symbols[I].Typ; LoadSymbol(I);
       if Token=tkLB then begin
@@ -774,7 +880,7 @@ begin
 end;
 
 procedure Statement;
-var I, Start, P, Q, Limit: Word; Direction: Byte; Name: TShortString;
+var I, Start, P, Q, Limit: Word; Direction: Byte; Name, VarName: TShortString;
 begin
   case Token of
     tkBegin:begin NextToken; StatementList(tkEnd); Need(tkEnd) end;
@@ -796,10 +902,10 @@ begin
     tkFor:begin
       NextToken;
       if Token<>tkIdent then Fail(2,'Variable de boucle attendue');
-      I:=FindSymbol(TokenText); if I=0 then Fail(3,'Variable inconnue');
+      Name:=TokenText; NextToken; I:=ResolveSymbol(Name);
       if (Symbols[I].Kind<>skVar) or (Symbols[I].Typ<>ttInteger) or
         (Symbols[I].Width<>2) then Unsupported('FOR non Integer');
-      NextToken; Need(tkAssign); RequireInteger(Expression); SaveSymbol(I);
+      Need(tkAssign); RequireInteger(Expression); SaveSymbol(I);
       Direction:=Token;
       if not (Direction in [tkTo,tkDownto]) then Fail(58,'TO ou DOWNTO attendu');
       NextToken; RequireInteger(Expression);
@@ -814,21 +920,21 @@ begin
     end;
     tkIdent:begin
       Name:=TokenText; NextToken;
-      if (Name='WRITE') or (Name='WRITELN') then WriteStatement(Name='WRITELN')
-      else if Name='HALT' then begin
+      if (Token<>tkDot) and ((Name='WRITE') or (Name='WRITELN')) then WriteStatement(Name='WRITELN')
+      else if (Token<>tkDot) and (Name='HALT') then begin
         if Token=tkLP then begin NextToken; RequireInteger(Expression); Need(tkRP) end
         else LoadImmediate(0);
         Emit2($B4,$4C); Emit2($CD,$21);
-      end else if Name='EXIT' then begin
+      end else if (Token<>tkDot) and (Name='EXIT') then begin
         if not InProcedure then Unsupported('EXIT du programme principal');
         Emit($C3);
-      end else if (Name='INC') or (Name='DEC') then begin
+      end else if (Token<>tkDot) and ((Name='INC') or (Name='DEC')) then begin
         Need(tkLP);
         if Token<>tkIdent then Fail(2,'Variable attendue');
-        I:=FindSymbol(TokenText); if I=0 then Fail(3,'Variable inconnue');
+        VarName:=TokenText; NextToken; I:=ResolveSymbol(VarName);
         if (Symbols[I].Kind<>skVar) or (Symbols[I].Typ<>ttInteger) then
           Fail(38,'Variable entiere attendue');
-        NextToken; LoadSymbol(I);
+        LoadSymbol(I);
         if Token=tkComma then begin
           Emit($50); NextToken; RequireInteger(Expression);
           Emit2($89,$C3); Emit($58);
@@ -836,7 +942,7 @@ begin
         end else if Name='INC' then Emit($40) else Emit($48);
         Need(tkRP); SaveSymbol(I);
       end else begin
-        I:=FindSymbol(Name); if I=0 then Fail(3,'Identificateur inconnu: '+Name);
+        I:=ResolveSymbol(Name);
         if Symbols[I].Kind=skProc then begin
           if Token=tkLP then Unsupported('parametres de procedure');
           CallTo(Symbols[I].Addr);
@@ -920,12 +1026,108 @@ begin
   if InProcedure then Unsupported('procedure imbriquee');
   NextToken;
   if Token<>tkIdent then Fail(2,'Nom de procedure attendu');
-  I:=NewSymbol(TokenText); Symbols[I].Kind:=skProc; Symbols[I].Addr:=CodeSize;
+  I:=FindOwnSymbol(TokenText);
+  if (I<>0) and not InInterface then begin
+    if (Symbols[I].Kind<>skProc) or Symbols[I].HasBody then
+      Fail(4,'Identificateur duplique: '+TokenText);
+  end else begin
+    I:=NewSymbol(TokenText); Symbols[I].Kind:=skProc; Symbols[I].Addr:=CodeSize;
+  end;
   NextToken;
   if Token=tkLP then Unsupported('procedure a parametres');
   Need(tkSemi);
+  if InInterface then begin
+    { Point d'entree stable pour les appels avant la definition du corps. }
+    Symbols[I].ForwardJump:=Jump; Exit;
+  end;
   if Token<>tkBegin then Unsupported('declarations locales ou directives de procedure');
+  if Symbols[I].Exported then PatchJump(Symbols[I].ForwardJump,CodeSize);
+  Symbols[I].HasBody:=True;
   InProcedure:=True; Statement; Emit($C3); InProcedure:=False; Need(tkSemi);
+end;
+
+procedure DeclarationPart;
+begin
+  while Token in [tkConst,tkVar,tkProcedure] do case Token of
+    tkConst:ConstDeclarations; tkVar:VarDeclarations;
+    tkProcedure:ProcedureDeclaration;
+  end;
+  if Token in [tkType,tkFunction,tkLabel,tkConstructor,tkDestructor] then
+    Unsupported('declaration: '+TokenText);
+end;
+
+procedure LoadSource; forward;
+procedure UsesClause; forward;
+
+procedure SaveParser(var P: PParserState);
+begin
+  New(P); New(P^.Buffer);
+  Move(Source,P^.Buffer^,SourceSize);
+  P^.SourceName:=SourceName; P^.SourceSize:=SourceSize; P^.SourcePos:=SourcePos;
+  P^.Line:=Line; P^.Column:=Column;
+  P^.TokenLine:=TokenLine; P^.TokenColumn:=TokenColumn;
+  P^.Token:=Token; P^.TokenText:=TokenText; P^.TokenValue:=TokenValue;
+  P^.TokenIsString:=TokenIsString; P^.Active:=Active;
+  P^.InProcedure:=InProcedure; P^.InInterface:=InInterface;
+  P^.CondDepth:=CondDepth; P^.CurrentUnit:=CurrentUnit; P^.Imports:=Imports;
+  Move(ImportOrder,P^.ImportOrder,SizeOf(ImportOrder)); P^.ImportCount:=ImportCount;
+  Move(Conditions,P^.Conditions,SizeOf(Conditions));
+  Move(Defines,P^.Defines,SizeOf(Defines)); P^.DefineCount:=DefineCount;
+  P^.OptionBits:=OptionBits; P^.StackSize:=StackSize;
+  P^.MinHeap:=MinHeap; P^.MaxHeap:=MaxHeap;
+end;
+
+procedure RestoreParser(P: PParserState);
+begin
+  Move(P^.Buffer^,Source,P^.SourceSize);
+  SourceName:=P^.SourceName; SourceSize:=P^.SourceSize; SourcePos:=P^.SourcePos;
+  Line:=P^.Line; Column:=P^.Column;
+  TokenLine:=P^.TokenLine; TokenColumn:=P^.TokenColumn;
+  Token:=P^.Token; TokenText:=P^.TokenText; TokenValue:=P^.TokenValue;
+  TokenIsString:=P^.TokenIsString; Active:=P^.Active;
+  InProcedure:=P^.InProcedure; InInterface:=P^.InInterface;
+  CondDepth:=P^.CondDepth; CurrentUnit:=P^.CurrentUnit; Imports:=P^.Imports;
+  Move(P^.ImportOrder,ImportOrder,SizeOf(ImportOrder)); ImportCount:=P^.ImportCount;
+  Move(P^.Conditions,Conditions,SizeOf(Conditions));
+  Move(P^.Defines,Defines,SizeOf(Defines)); DefineCount:=P^.DefineCount;
+  OptionBits:=P^.OptionBits; StackSize:=P^.StackSize;
+  MinHeap:=P^.MinHeap; MaxHeap:=P^.MaxHeap;
+  Dispose(P^.Buffer); Dispose(P);
+end;
+
+procedure CompileSourceUnit(U: Byte; Path: TShortString);
+var P: PParserState; I: Word;
+begin
+  SaveParser(P);
+  SourceName:=Path; CurrentUnit:=U; Imports:=[]; ImportCount:=0;
+  InInterface:=True; InProcedure:=False;
+  { Les directives locales d'une unite ne fuient ni dans ses dependances
+    ni dans le programme appelant. Les /D de la CLI restent disponibles. }
+  Move(InitialDefines,Defines,SizeOf(Defines)); DefineCount:=InitialDefineCount;
+  OptionBits:=InitialOptions;
+  LoadSource;
+  if not Quiet then WriteLn('Building unit ',Units[U].Name,': ',Path);
+  NextToken; Need(tkUnit);
+  if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
+  if TokenText<>Units[U].Name then Fail(69,Units[U].Name+' <> '+TokenText);
+  NextToken; Need(tkSemi); Need(tkInterface);
+  UsesClause; DeclarationPart;
+  Units[U].InterfaceReady:=True;
+  Need(tkImplementation); InInterface:=False;
+  UsesClause; DeclarationPart;
+  for I:=1 to SymbolCount do
+    if (Symbols[I].Owner=U) and (Symbols[I].Kind=skProc) and
+      not Symbols[I].HasBody then Fail(59,Symbols[I].Name);
+  if Token=tkBegin then begin
+    Units[U].HasInit:=True; Units[U].InitAddress:=CodeSize;
+    { EXIT dans le bloc d'initialisation revient a l'appelant. }
+    InProcedure:=True; Statement; InProcedure:=False; Emit($C3);
+  end else Need(tkEnd);
+  Need(tkDot);
+  if Token<>tkEOF then Fail(10,'Texte apres END.');
+  Units[U].State:=2;
+  if Units[U].HasInit then begin Inc(InitCount); InitOrder[InitCount]:=U end;
+  RestoreParser(P);
 end;
 
 function FileExists(S: TShortString): Boolean;
@@ -943,17 +1145,27 @@ begin
   JoinPath:=Dir+Name;
 end;
 
-function FindUnitFile(Name: TShortString): TShortString;
-var D: DirStr; N: NameStr; E: ExtStr; S, Part, Candidate: TShortString; P: Integer;
+function FindUnitPath(Name, Extension: TShortString): TShortString;
+var D, MainDir: DirStr; N: NameStr; E: ExtStr;
+    S, Part, Candidate: TShortString; P: Integer;
 begin
-  FSplit(SourceName,D,N,E); S:=D+';'+UnitDirs;
-  FindUnitFile:='';
+  FindUnitPath:='';
+  { TP6 consulte le repertoire de sortie avant les repertoires d'unites
+    pour les TPU, mais PAS pour choisir le source a reconstruire. }
+  if (Extension='.TPU') and (OutputDir<>'') then begin
+    Candidate:=JoinPath(OutputDir,Name+Extension);
+    if FileExists(Candidate) then begin FindUnitPath:=Candidate; Exit end;
+  end;
+  FSplit(SourceName,D,N,E); FSplit(MainSourceName,MainDir,N,E);
+  if Length(D)+Length(MainDir)+Length(UnitDirs)+4>255 then
+    CLIError('Liste de recherche des unites trop longue');
+  S:=D+';'+MainDir+';.;'+UnitDirs;
   repeat
     P:=Pos(';',S);
     if P=0 then begin Part:=S; S:='' end
     else begin Part:=Copy(S,1,P-1); Delete(S,1,P) end;
-    Candidate:=JoinPath(Part,Name+'.TPU');
-    if FileExists(Candidate) then begin FindUnitFile:=Candidate; Exit end;
+    Candidate:=JoinPath(Part,Name+Extension);
+    if FileExists(Candidate) then begin FindUnitPath:=Candidate; Exit end;
   until S='';
 end;
 
@@ -980,7 +1192,7 @@ begin
 end;
 
 procedure UsesClause;
-var Name, Path: TShortString; H: TUnitHeader;
+var Name, Path: TShortString; H: TUnitHeader; U: Byte;
 begin
   if Token<>tkUses then Exit;
   NextToken;
@@ -988,10 +1200,27 @@ begin
     if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
     Name:=TokenText; NextToken;
     if Name<>'SYSTEM' then begin
-      Path:=FindUnitFile(Name);
-      if Path='' then Fail(15,'Fichier introuvable: '+Name+'.TPU');
-      ReadTPUHeader(Path,H);
-      Unsupported('liaison TPU9 de '+Name+' (en-tete valide)');
+      U:=FindBuildUnit(Name);
+      if U<>0 then begin
+        if (U=CurrentUnit) or ((Units[U].State=1) and not Units[U].InterfaceReady) then
+          Fail(68,Name);
+      end else begin
+        Path:='';
+        if BuildMode then Path:=FindUnitPath(Name,'.PAS');
+        if Path<>'' then begin
+          if UnitCount=MaxUnits then Unsupported('plus de 64 unites');
+          Inc(UnitCount); U:=UnitCount;
+          FillChar(Units[U],SizeOf(TBuildUnit),0);
+          Units[U].Name:=Name; Units[U].State:=1;
+          CompileSourceUnit(U,Path);
+        end else begin
+          Path:=FindUnitPath(Name,'.TPU');
+          if Path='' then Fail(15,'Fichier introuvable: '+Name+'.TPU');
+          ReadTPUHeader(Path,H);
+          Unsupported('liaison TPU9 de '+Name+' (source absent, en-tete valide)');
+        end;
+      end;
+      AddImport(U);
     end;
     if Token<>tkComma then Break;
     NextToken;
@@ -1038,8 +1267,11 @@ begin
 end;
 
 procedure CompileProgram;
+var I: Byte;
 begin
   CodeSize:=0; DataSize:=0; SymbolCount:=0; FixupCount:=0;
+  UnitCount:=0; InitCount:=0; CurrentUnit:=0; Imports:=[]; ImportCount:=0;
+  InInterface:=False;
   Emit($0E); Emit($1F); Emit($0E); Emit($07); Emit($FC); { DS=ES=CS; cld }
   EntryFixup:=Jump;
   EmitRuntime;
@@ -1055,13 +1287,9 @@ begin
     Need(tkSemi);
   end;
   UsesClause;
-  while Token in [tkConst,tkVar,tkProcedure] do case Token of
-    tkConst:ConstDeclarations; tkVar:VarDeclarations;
-    tkProcedure:ProcedureDeclaration;
-  end;
-  if Token in [tkType,tkFunction,tkLabel,tkConstructor,tkDestructor] then
-    Unsupported('declaration: '+TokenText);
+  DeclarationPart;
   PatchJump(EntryFixup,CodeSize);
+  for I:=1 to InitCount do CallTo(Units[InitOrder[I]].InitAddress);
   Need(tkBegin); StatementList(tkEnd); Need(tkEnd); Need(tkDot);
   if Token<>tkEOF then Fail(10,'Texte apres END.');
   LoadImmediate($4C00); Emit2($CD,$21);
@@ -1135,7 +1363,9 @@ procedure Help;
 begin
   WriteLn('TPC - portage PARTIEL de Turbo Pascal 6, cible DOS 8086');
   WriteLn('TPC fichier.pas [/Erepertoire] [/Urepertoires] [/Dsymboles] [/$X-]');
-  WriteLn('/B, /M reconnus, refuses: construction des unites non implementee.');
+  WriteLn('/B reconstruit les unites depuis leurs sources (sous-ensemble Pascal).');
+  WriteLn('Pas de production TPU; liaison des TPU existantes non implementee.');
+  WriteLn('/M reconnu, refuse: reconstruction incrementale non implementee.');
   WriteLn('/Q silencieux; /T repertoire Turbo (cherche les TPU).');
   WriteLn('/I, /O, /L, /V, /F, /G reconnus mais refuses: fonctions manquantes.');
   WriteLn('Extension locale: --inspect-tpu=fichier.tpu; --quiet; --help.');
@@ -1210,9 +1440,12 @@ begin
   ParseArguments;
   if InspectName<>'' then begin SourceName:=InspectName; InspectTPU; Halt(0) end;
   if InputName='' then CLIError('Fichier source manquant');
-  if BuildMode or MakeMode then Unsupported('/B ou /M: construction des unites');
+  if MakeMode and not BuildMode then Unsupported('/M: construction incrementale des unites');
   SourceName:=InputName; FSplit(SourceName,D,N,E);
   if E='' then SourceName:=SourceName+'.PAS';
+  MainSourceName:=SourceName;
+  Move(Defines,InitialDefines,SizeOf(Defines)); InitialDefineCount:=DefineCount;
+  InitialOptions:=OptionBits;
   if not Quiet then WriteLn('TPC: portage partiel TP6; hote Pascal, cible DOS 8086');
   LoadSource; CompileProgram; WriteExecutable;
 end.
