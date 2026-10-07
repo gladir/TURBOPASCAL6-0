@@ -14,7 +14,7 @@ Program TPC;
   Hote valide: Free Pascal 3.2, mode TP, strings courts uniquement.
   Cible: DOS MZ, instructions 8086, un segment CS/DS et pile separee.
   Restrictions explicites: ABI Borland partielle (ordinaux 8/16 bits), pas d'OBJ, real, tableaux, objets,
-  types structures, procedures a parametres, ASM.
+  types structures, signatures structurees, ASM.
   Dictionnaire par unite/portee; types nommes ordinaux/chaine, constantes
   calculees et typees, frames locales et liens statiques pour procedures.
   /B recompile les sources et produit des fichiers TPU. Unites de code:
@@ -196,6 +196,11 @@ Type
   ParamSigned: Array[1..MaxNativeParams] Of Boolean;
   Scope, HashNext, TypeId: Word;
   Local: Boolean;
+  ByReference, ResultVariable, FarRoutine, ForwardDeclared: Boolean;
+  LegacyCall: Boolean;
+  RoutineSymbol, ResultSymbol, ParamBytes: Word;
+  ParamTypeIds: Array[1..MaxNativeParams] Of Word;
+  ParamNames: Array[1..MaxNativeParams] Of String[63];
  End;
  TTypeInfo = Packed Record
   Typ, Width, Capacity: Byte;
@@ -206,6 +211,7 @@ Type
  End;
  TScopeInfo = Record
   Parent, ProcSymbol, LocalSize: Word;
+  LinkOffset: Word;
   Owner: Byte;
  End;
  TConstValue = Record
@@ -356,63 +362,65 @@ End;
 
 Function ErrorMessage(N: Word): TShortString;Begin
  Case N Of
- 2:ErrorMessage:='Identifier expected';
- 3:ErrorMessage:='Unknown identifier';
- 4:ErrorMessage:='Duplicate identifier';
- 5:ErrorMessage:='Syntax error';
- 7:ErrorMessage:='Error in integer constant';
- 8:ErrorMessage:='String constant exceeds line';
- 10:ErrorMessage:='Unexpected end of file';
+  2:ErrorMessage:='Identifier expected';
+  3:ErrorMessage:='Unknown identifier';
+  4:ErrorMessage:='Duplicate identifier';
+  5:ErrorMessage:='Syntax error';
+  7:ErrorMessage:='Error in integer constant';
+  8:ErrorMessage:='String constant exceeds line';
+  10:ErrorMessage:='Unexpected end of file';
   12:ErrorMessage:='Type identifier expected';
- 15:ErrorMessage:='File not found';
- 16:ErrorMessage:='Disk full';
- 17:ErrorMessage:='Invalid compiler directive';
- 20:ErrorMessage:='Variable identifier expected';
- 25:ErrorMessage:='Invalid string length';
- 26:ErrorMessage:='Type mismatch';
+  15:ErrorMessage:='File not found';
+  16:ErrorMessage:='Disk full';
+  17:ErrorMessage:='Invalid compiler directive';
+  20:ErrorMessage:='Variable identifier expected';
+  25:ErrorMessage:='Invalid string length';
+  26:ErrorMessage:='Type mismatch';
   27:ErrorMessage:='Invalid subrange base type';
   28:ErrorMessage:='Lower bound greater than upper bound';
   31:ErrorMessage:='Constant expected';
+  34:ErrorMessage:='Invalid function result type';
+  36:ErrorMessage:='BEGIN expected';
+  37:ErrorMessage:='END expected';
+  38:ErrorMessage:='Integer expression expected';
+  40:ErrorMessage:='Boolean expression expected';
+  42:ErrorMessage:='Error in expression';
+  43:ErrorMessage:='Illegal assignment';
+  48:ErrorMessage:='Code segment too large';
+  49:ErrorMessage:='Data segment too large';
+  50:ErrorMessage:='DO expected';
+  54:ErrorMessage:='OF expected';
+  55:ErrorMessage:='INTERFACE expected';
+  57:ErrorMessage:='THEN expected';
+  58:ErrorMessage:='TO or DOWNTO expected';
+  59:ErrorMessage:='Undefined forward';
   61:ErrorMessage:='Division by zero';
- 36:ErrorMessage:='BEGIN expected';
- 37:ErrorMessage:='END expected';
- 38:ErrorMessage:='Integer expression expected';
- 40:ErrorMessage:='Boolean expression expected';
- 42:ErrorMessage:='Error in expression';
- 43:ErrorMessage:='Illegal assignment';
- 48:ErrorMessage:='Code segment too large';
- 49:ErrorMessage:='Data segment too large';
- 50:ErrorMessage:='DO expected';
- 54:ErrorMessage:='OF expected';
- 55:ErrorMessage:='INTERFACE expected';
- 57:ErrorMessage:='THEN expected';
- 58:ErrorMessage:='TO or DOWNTO expected';
- 59:ErrorMessage:='Undefined forward';
- 66:ErrorMessage:='String expression expected';
- 68:ErrorMessage:='Circular unit reference';
- 69:ErrorMessage:='Unit name mismatch';
- 70:ErrorMessage:='Unit version mismatch';
- 72:ErrorMessage:='Unit file format error';
- 73:ErrorMessage:='IMPLEMENTATION expected';
- 76:ErrorMessage:='Constant out of range';
- 84:ErrorMessage:='UNIT expected';
- 85:ErrorMessage:='";" expected';
- 86:ErrorMessage:='":" expected';
- 87:ErrorMessage:='"," expected';
- 88:ErrorMessage:='"(" expected';
- 89:ErrorMessage:='")" expected';
- 90:ErrorMessage:='"=" expected';
- 91:ErrorMessage:='":=" expected';
- 92:ErrorMessage:='"[" or "(." expected';
- 93:ErrorMessage:='"]" or ".)" expected';
- 94:ErrorMessage:='"." expected';
- 95:ErrorMessage:='".." expected';
+  66:ErrorMessage:='String expression expected';
+  68:ErrorMessage:='Circular unit reference';
+  69:ErrorMessage:='Unit name mismatch';
+  70:ErrorMessage:='Unit version mismatch';
+  72:ErrorMessage:='Unit file format error';
+  73:ErrorMessage:='IMPLEMENTATION expected';
+  76:ErrorMessage:='Constant out of range';
+  84:ErrorMessage:='UNIT expected';
+  85:ErrorMessage:='";" expected';
+  86:ErrorMessage:='":" expected';
+  87:ErrorMessage:='"," expected';
+  88:ErrorMessage:='"(" expected';
+  89:ErrorMessage:='")" expected';
+  90:ErrorMessage:='"=" expected';
+  91:ErrorMessage:='":=" expected';
+  92:ErrorMessage:='"[" or "(." expected';
+  93:ErrorMessage:='"]" or ".)" expected';
+  94:ErrorMessage:='"." expected';
+  95:ErrorMessage:='".." expected';
   97:ErrorMessage:='Invalid FOR control variable';
  106:ErrorMessage:='Character expression expected';
  120:ErrorMessage:='NIL expected';
  123:ErrorMessage:='Too many symbols';
  127:ErrorMessage:='Misplaced conditional directive';
  128:ErrorMessage:='ENDIF directive missing';
+  130:ErrorMessage:='Header does not match previous definition';
  Else ErrorMessage:='Compiler error';
 End;
 End;
@@ -508,7 +516,7 @@ Begin
  If B=0 Then CLIError('Option inconnue: $'+S);
   { Accepter une option sans en respecter l'effet serait trompeur. }
  If S[2]='+' Then Begin
-  If UpCase(S[1]) In ['R','S','B','N','G','D','L','F','O','X'] Then      Unsupported(
+  If UpCase(S[1]) In ['R','S','B','N','G','D','L','O','X'] Then      Unsupported(
   'option $'+Upper(S));
   OptionBits:=OptionBits Or B;
  End Else OptionBits:=OptionBits And Not B;
@@ -1042,7 +1050,7 @@ Begin
  S:=CurrentScope;
  While S<>Scope Do Begin
   If S=0 Then Unsupported('lien statique vers une portee non accessible');
-  Emit($36); Emit2($8B,$5F); Emit(4); { mov bx,ss:[bx+4] }
+  Emit($36); Emit2($8B,$9F); EmitWord(Scopes[S].LinkOffset);
   S:=Scopes[S].Parent;
  End;
 End;
@@ -1053,14 +1061,29 @@ Procedure AddSegmentRelocation(P: Word; Kind: Byte);Begin
  Relocations[RelocationCount].Segm:=0; RelocationKinds[RelocationCount]:=Kind;
 End;
 
-Procedure LocalCall(I: Word);
+Procedure EmitLocalCall(I: Word);
 Begin
- ScopeAddress(Symbols[I].Scope); Emit($53); CallTo(Symbols[I].Addr);
- Emit2($83,$C4); Emit(2);
+ ScopeAddress(Symbols[I].Scope); Emit($53);
+ If Symbols[I].FarRoutine Then Emit($0E);
+ CallTo(Symbols[I].Addr);
+ If Symbols[I].LegacyCall Then Begin Emit2($83,$C4); Emit(2) End;
 End;
 
 Procedure ProcedureExit;
-Begin Emit2($89,$EC); Emit($5D); Emit($C3) End;
+Var I: Word;
+Begin
+ I:=Scopes[CurrentScope].ProcSymbol;
+ If Symbols[I].ResultSymbol<>0 Then Begin
+  { AX/AL contient le resultat ordinal apres restauration de la frame. }
+  Emit2($8B,$86); EmitWord(Symbols[Symbols[I].ResultSymbol].Addr);
+  If Symbols[I].Width=1 Then Begin
+   If Symbols[I].SignedByte Then Emit($98) Else Emit2($30,$E4);
+  End;
+ End;
+ Emit2($89,$EC); Emit($5D);
+ If Symbols[I].FarRoutine Then Emit($CA) Else Emit($C2);
+ EmitWord(Symbols[I].ParamBytes+2); { parametres + lien statique local }
+End;
 
 Procedure NativeReference(U, Kind: Byte; Map, Target: Word);Begin
  If NativeRefCount=MaxNativeRefs Then Unsupported('trop de references Borland');
@@ -1088,12 +1111,40 @@ Begin
  NativeReference(Symbols[I].Owner,K,Symbols[I].NativeMap,Symbols[I].Addr);
 End;
 
+Procedure ReferencePointer(I: Word);
+Begin
+ ScopeAddress(Symbols[I].Scope);
+ Emit($36); Emit2($C4,$BF); EmitWord(Symbols[I].Addr); { les di,ss:[bx+offset] }
+End;
+
+Procedure PushVariableAddress(I: Word);
+Begin
+ If Symbols[I].ByReference Then Begin
+  ReferencePointer(I); Emit($06); Emit($57);
+ End Else If Symbols[I].Native Then Begin
+  NeedNative(Symbols[I].Owner);
+  Emit($B8); AddSegmentRelocation(CodeSize,1); EmitWord(0); Emit($50);
+  Emit($B8); NativeVarAddress(I); Emit($50);
+ End Else If Symbols[I].Local Then Begin
+  ScopeAddress(Symbols[I].Scope); Emit2($81,$C3); EmitWord(Symbols[I].Addr);
+  Emit($16); Emit($53);
+ End Else Begin
+  Emit($1E); Emit($B8); DataAddress(Symbols[I].Addr); Emit($50);
+ End;
+End;
+
 Procedure LoadSymbol(I: Word);Begin
  If Symbols[I].Kind=skType Then Fail(42,'Type utilise comme valeur');
  If (Symbols[I].Kind=skConst) And (Symbols[I].Typ<>ttString) And
     ((Symbols[I].Value<-32768) Or (Symbols[I].Value>65535)) Then
   Unsupported('valeur constante hors code ordinal 16 bits');
- If Symbols[I].Local Then Begin
+ If Symbols[I].ByReference Then Begin
+  ReferencePointer(I); Emit($26);
+  If Symbols[I].Width=1 Then Emit2($8A,$05) Else Emit2($8B,$05);
+  If Symbols[I].Width=1 Then Begin
+   If Symbols[I].SignedByte Then Emit($98) Else Emit2($30,$E4);
+  End;
+ End Else If Symbols[I].Local Then Begin
   ScopeAddress(Symbols[I].Scope); Emit($36);
   If Symbols[I].Width=1 Then Emit2($8A,$87) Else Emit2($8B,$87);
   EmitWord(Symbols[I].Addr);
@@ -1124,6 +1175,11 @@ Procedure LoadSymbol(I: Word);Begin
 End;
 
 Procedure SaveSymbol(I: Word);Begin
+ If Symbols[I].ByReference Then Begin
+  ReferencePointer(I); Emit($26);
+  If Symbols[I].Width=1 Then Emit2($88,$05) Else Emit2($89,$05);
+  Exit;
+ End;
  If Symbols[I].Local Then Begin
   ScopeAddress(Symbols[I].Scope); Emit($36);
   If Symbols[I].Width=1 Then Emit2($88,$87) Else Emit2($89,$87);
@@ -1140,6 +1196,7 @@ End;
 Function Expression: Byte;Forward;
 Procedure Statement;Forward;
 Function NativeCall(I: Word): Byte;Forward;
+Function UserCall(I: Word): Byte;Forward;
 Function ReadType: Word; Forward;
 
 Procedure RequireInteger(T: Byte);Begin
@@ -1242,9 +1299,10 @@ Begin
   End Else
   Begin
    I:=ResolveSymbol(Name);
+  If Symbols[I].ResultVariable And (Token=tkLP) Then I:=Symbols[I].RoutineSymbol;
    If Symbols[I].Kind=skProc Then Begin
-    If Not Symbols[I].Native Then Unsupported('fonction: '+Name);
-    T:=NativeCall(I);
+   If Symbols[I].Typ=ttVoid Then Fail(42,'Procedure utilisee comme fonction');
+   If Symbols[I].Native Then T:=NativeCall(I) Else T:=UserCall(I);
     ExprKnown:=False;
     ExprType:=SymbolType(I);
     If T=ttVoid Then Fail(42,'Fonction attendue');
@@ -1430,17 +1488,7 @@ Begin
     (Symbols[V].Width<>Symbols[I].ParamWidths[J]) Or
     (Symbols[V].SignedByte<>Symbols[I].ParamSigned[J]) Then Fail(26,
     'Type du parametre var');
-    If Symbols[V].Native Then Begin
-     NeedNative(Symbols[V].Owner);
-     Emit($B8); AddSegmentRelocation(CodeSize,1); EmitWord(0); Emit($50);
-     Emit($B8); NativeVarAddress(V); Emit($50);
-    End Else If Symbols[V].Local Then Begin
-     ScopeAddress(Symbols[V].Scope); Emit2($81,$C3); EmitWord(Symbols[V].Addr);
-     Emit($16); Emit($53);
-    End Else
-    Begin
-     Emit($1E); Emit($B8); DataAddress(Symbols[V].Addr); Emit($50);
-    End;
+    PushVariableAddress(V);
    End Else
    Begin
     T:=Expression;
@@ -1463,6 +1511,39 @@ Begin
   If Symbols[I].SignedByte Then Emit($98) Else Emit2($30,$E4);
  End;
  NativeCall:=Symbols[I].Typ;
+End;
+
+Function UserCall(I: Word): Byte;
+Var J,V,T: Word; Kind: Byte; Name: TShortString;
+Begin
+ Emit($06); { preserve ES: indirect var accesses use LES }
+ If Symbols[I].ParamCount<>0 Then Begin
+  Need(tkLP);
+  For J:=1 To Symbols[I].ParamCount Do Begin
+   If J<>1 Then Need(tkComma);
+   T:=Symbols[I].ParamTypeIds[J];
+   If Symbols[I].ParamFlags[J]=6 Then Begin
+    If Token<>tkIdent Then Fail(20,'Variable pour parametre var attendue');
+    Name:=TokenText; NextToken; V:=ResolveSymbol(Name);
+    If (Symbols[V].Kind<>skVar) Or (SymbolType(V)<>T) Then Fail(26,'Identite du parametre var');
+    PushVariableAddress(V);
+   End Else Begin
+    Kind:=Expression;
+    If (Kind<>Types[T].Typ) Or Not CompatibleTypes(T,ExprType) Then Fail(26,'Type du parametre valeur');
+    If ExprKnown And ((ExprValue<Types[T].LowBound) Or (ExprValue>Types[T].HighBound)) Then
+      Fail(76,'Parametre constant hors limites');
+    If Types[T].Width=1 Then Begin
+     If Types[T].Signed Then Emit($98) Else Emit2($30,$E4);
+    End;
+    Emit($50);
+   End;
+  End;
+  Need(tkRP);
+ End Else If Token=tkLP Then Begin NextToken; Need(tkRP) End;
+ EmitLocalCall(I); Emit($07);
+ UserCall:=Symbols[I].Typ;
+ ExprType:=SymbolType(I); ExprKnown:=False;
+ ExprUnsigned:=(Symbols[I].Typ=ttInteger) And (ExprType<>0) And Not Types[ExprType].Signed;
 End;
 
 Procedure Assignment(I: Word);
@@ -1630,8 +1711,8 @@ Begin
      If Ignored<>ttVoid Then Unsupported('resultat de fonction ignore sans $X+');
     End Else
     Begin
-     If Token=tkLP Then Unsupported('parametres de procedure');
-    LocalCall(I);
+      Ignored:=UserCall(I);
+      If Ignored<>ttVoid Then Unsupported('resultat de fonction ignore sans $X+');
     End;
    End Else Assignment(I);
   End;
@@ -1984,47 +2065,141 @@ Procedure DeclarationPart; Forward;
 
 Procedure ProcedureDeclaration;
 Var
- I,Parent,FramePatch,Skip: Word; SavedProcedure: Boolean;
+ I,Parent,FramePatch,Skip,J,K,T,V,ParamOffset,Size,Link: Word;
+ SavedProcedure,IsFunction,Existing,FullHeading,ByVar,IsForward,HasDistance: Boolean;
+ Sig: TSymbol; Name: TShortString;
+ Names: Array[1..MaxNativeParams] Of String[63]; N: Byte;
 Begin
+ IsFunction:=Token=tkFunction; FillChar(Sig,SizeOf(Sig),0);
+ Sig.Kind:=skProc; Sig.Typ:=ttVoid;
  NextToken;
  If Token<>tkIdent Then Fail(2,'Nom de procedure attendu');
+ Name:=TokenText;
  I:=FindOwnSymbol(TokenText);
- If (I<>0) And Not InInterface Then Begin
+ Existing:=I<>0;
+ If Existing Then Begin
   If (Symbols[I].Kind<>skProc) Or Symbols[I].HasBody Then      Fail(4,
   'Identificateur duplique: '+TokenText);
- End Else
- Begin
-  I:=NewSymbol(TokenText); Symbols[I].Kind:=skProc; Symbols[I].Addr:=CodeSize;
  End;
  NextToken;
- If Token=tkLP Then Unsupported('procedure a parametres');
- Need(tkSemi);
- If InInterface Then Begin
-    { Point d'entree stable pour les appels avant la definition du corps. }
-  Symbols[I].ForwardJump:=Jump; Exit;
+ FullHeading:=Token=tkLP;
+ If Token=tkLP Then Begin
+  NextToken;
+  While Token<>tkRP Do Begin
+   ByVar:=Token=tkVar; If ByVar Then NextToken;
+   N:=0;
+   Repeat
+    If Token<>tkIdent Then Fail(2,'Nom de parametre attendu');
+    If N=MaxNativeParams Then Unsupported('plus de 8 parametres');
+    Inc(N); Names[N]:=TokenText; NextToken;
+    If Token<>tkComma Then Break;
+    NextToken;
+   Until False;
+   Need(tkColon); T:=ReadType;
+   If Not (Types[T].Typ In [ttInteger,ttBoolean,ttChar,ttEnum]) Then
+    Unsupported('parametre utilisateur non ordinal');
+   For J:=1 To N Do Begin
+    If Sig.ParamCount=MaxNativeParams Then Unsupported('plus de 8 parametres');
+    Inc(Sig.ParamCount); K:=Sig.ParamCount;
+    For V:=1 To K-1 Do If Sig.ParamNames[V]=Names[J] Then Fail(4,'Parametre duplique');
+    Sig.ParamNames[K]:=Names[J]; Sig.ParamTypeIds[K]:=T;
+    Sig.ParamTypes[K]:=Types[T].Typ; Sig.ParamWidths[K]:=Types[T].Width;
+    Sig.ParamSigned[K]:=Types[T].Signed And (Types[T].Width=1);
+    If ByVar Then Begin Sig.ParamFlags[K]:=6; Inc(Sig.ParamBytes,4) End
+    Else Begin Sig.ParamFlags[K]:=2; Inc(Sig.ParamBytes,2) End;
+   End;
+   If Token<>tkSemi Then Break;
+   NextToken;
+  End;
+  Need(tkRP);
  End;
- If Symbols[I].Exported Then PatchJump(Symbols[I].ForwardJump,CodeSize);
+ If IsFunction Then Begin
+  If Token=tkColon Then Begin
+   FullHeading:=True; NextToken; T:=ReadType;
+   If Not (Types[T].Typ In [ttInteger,ttBoolean,ttChar,ttEnum]) Then
+    Fail(34,'Resultat de fonction non ordinal');
+   Sig.TypeId:=T; Sig.Typ:=Types[T].Typ; Sig.Width:=Types[T].Width;
+   Sig.SignedByte:=Types[T].Signed And (Types[T].Width=1);
+  End Else If Not Existing Then Need(tkColon);
+ End;
+ Need(tkSemi);
+ IsForward:=False; HasDistance:=False;
+ Sig.FarRoutine:=InInterface Or (OptionBits And $20<>0);
+ While (Token=tkIdent) And ((TokenText='FORWARD') Or (TokenText='NEAR') Or (TokenText='FAR')) Do Begin
+  If TokenText='FORWARD' Then IsForward:=True
+  Else Begin
+   If HasDistance Then Fail(5,'Directive de distance dupliquee');
+   HasDistance:=True; Sig.FarRoutine:=TokenText='FAR';
+  End;
+  NextToken; Need(tkSemi);
+ End;
+ If Existing Then Begin
+  If IsFunction<>(Symbols[I].Typ<>ttVoid) Then Fail(130,'Procedure/fonction differente');
+  If FullHeading Then Begin
+   If (Sig.ParamCount<>Symbols[I].ParamCount) Or (Sig.TypeId<>Symbols[I].TypeId) Then
+    Fail(130,'Signature de routine differente');
+   For J:=1 To Sig.ParamCount Do
+    If (Sig.ParamNames[J]<>Symbols[I].ParamNames[J]) Or
+      (Sig.ParamTypeIds[J]<>Symbols[I].ParamTypeIds[J]) Or
+      (Sig.ParamFlags[J]<>Symbols[I].ParamFlags[J]) Then Fail(130,'Signature de parametre differente');
+  End;
+  If HasDistance And (Sig.FarRoutine<>Symbols[I].FarRoutine) Then Fail(130,'Distance near/far differente');
+  If InInterface Or IsForward Then Fail(4,'Declaration de routine dupliquee');
+ End Else Begin
+  I:=NewSymbol(Name);
+  { Conserver l'entree du dictionnaire, remplir uniquement la signature. }
+  Symbols[I].Kind:=skProc; Symbols[I].Typ:=Sig.Typ; Symbols[I].Width:=Sig.Width;
+  Symbols[I].TypeId:=Sig.TypeId; Symbols[I].SignedByte:=Sig.SignedByte;
+  Symbols[I].ParamCount:=Sig.ParamCount; Symbols[I].ParamBytes:=Sig.ParamBytes;
+  Symbols[I].FarRoutine:=Sig.FarRoutine;
+  For J:=1 To Sig.ParamCount Do Begin
+   Symbols[I].ParamTypeIds[J]:=Sig.ParamTypeIds[J]; Symbols[I].ParamNames[J]:=Sig.ParamNames[J];
+   Symbols[I].ParamTypes[J]:=Sig.ParamTypes[J]; Symbols[I].ParamWidths[J]:=Sig.ParamWidths[J];
+   Symbols[I].ParamSigned[J]:=Sig.ParamSigned[J]; Symbols[I].ParamFlags[J]:=Sig.ParamFlags[J];
+  End;
+  Symbols[I].Addr:=CodeSize; Symbols[I].ForwardJump:=Jump;
+ End;
+ If InInterface Or IsForward Then Begin Symbols[I].ForwardDeclared:=True; Exit End;
+ PatchJump(Symbols[I].ForwardJump,CodeSize);
  Symbols[I].HasBody:=True;
  Parent:=CurrentScope; SavedProcedure:=InProcedure;
  If ScopeCount=MaxScopes Then Unsupported('plus de 128 portees');
  Inc(ScopeCount); CurrentScope:=ScopeCount;
  Scopes[CurrentScope].Parent:=Parent; Scopes[CurrentScope].Owner:=CurrentUnit;
  Scopes[CurrentScope].ProcSymbol:=I; Scopes[CurrentScope].LocalSize:=0;
+ If Symbols[I].FarRoutine Then Link:=6 Else Link:=4;
+ Scopes[CurrentScope].LinkOffset:=Link;
+ ParamOffset:=Link+2+Symbols[I].ParamBytes;
+ For J:=1 To Symbols[I].ParamCount Do Begin
+  Size:=2; If Symbols[I].ParamFlags[J]=6 Then Size:=4;
+  Dec(ParamOffset,Size); V:=NewSymbol(Symbols[I].ParamNames[J]);
+  Symbols[V].Kind:=skVar; ApplyType(V,Symbols[I].ParamTypeIds[J]);
+  Symbols[V].Local:=True; Symbols[V].Addr:=ParamOffset;
+  Symbols[V].ByReference:=Symbols[I].ParamFlags[J]=6;
+ End;
+ If IsFunction Then Begin
+  V:=NewSymbol(Name); Symbols[V].Kind:=skVar; ApplyType(V,Symbols[I].TypeId);
+  AllocateVariable(V); Symbols[V].ResultVariable:=True; Symbols[V].RoutineSymbol:=I;
+  Symbols[I].ResultSymbol:=V;
+ End;
  InProcedure:=True;
  Emit($55); Emit2($89,$E5); Emit2($81,$EC); FramePatch:=CodeSize; EmitWord(0);
  Skip:=Jump; DeclarationPart; PatchJump(Skip,CodeSize);
+ For J:=1 To SymbolCount Do If (Symbols[J].Owner=CurrentUnit) And
+   (Symbols[J].Scope=CurrentScope) And (Symbols[J].Kind=skProc) And
+   Not Symbols[J].HasBody Then Fail(59,Symbols[J].Name);
  PatchWord(FramePatch,Scopes[CurrentScope].LocalSize);
  Statement; ProcedureExit;
  CurrentScope:=Parent; InProcedure:=SavedProcedure; Need(tkSemi);
 End;
 
 Procedure DeclarationPart;Begin
- While Token In [tkConst,tkType,tkVar,tkProcedure] Do Case Token Of
+ While Token In [tkConst,tkType,tkVar,tkProcedure,tkFunction] Do Case Token Of
  tkConst:ConstDeclarations; tkVar:VarDeclarations;
  tkType:TypeDeclarations;
- tkProcedure:ProcedureDeclaration;
+ tkProcedure,tkFunction:ProcedureDeclaration;
 End;
-If Token In [tkFunction,tkLabel,tkConstructor,tkDestructor] Then    Unsupported(
+If Token In [tkLabel,tkConstructor,tkDestructor] Then    Unsupported(
 'declaration: '+TokenText);
 End;
 Procedure LoadSource;Forward;
@@ -2352,7 +2527,7 @@ Begin
  Fail(72,'Offset hors section d''unite'); GlobalOffset:=0;
 End;
 
-Function InterfaceChecksumMode(U: Byte; WithTypes: Boolean): Word;
+Function InterfaceChecksumMode(U: Byte; WithTypes, WithCalls: Boolean): Word;
 Var
  I, K, N, Temp, T, Root: Word;
  J: Integer;
@@ -2378,6 +2553,18 @@ Begin
   I:=Order[K];
   For J:=1 To Length(Symbols[I].Name) Do Mix(Ord(Symbols[I].Name[J]));
   Mix(Symbols[I].Kind); Mix(Symbols[I].Typ);
+  If WithCalls And (Symbols[I].Kind=skProc) Then Begin
+   Mix(Ord(Symbols[I].FarRoutine)); Mix(Symbols[I].ParamCount); Mix(Symbols[I].ParamBytes);
+   For J:=1 To Symbols[I].ParamCount Do Begin
+    Mix(Symbols[I].ParamFlags[J]); T:=Symbols[I].ParamTypeIds[J];
+    Mix(Types[T].Typ); Mix(Types[T].Width); Mix(Types[T].Capacity); Mix(Ord(Types[T].Signed));
+    Mix(Word(Types[T].LowBound)); Mix(Word(Types[T].LowBound Shr 16));
+    Mix(Word(Types[T].HighBound)); Mix(Word(Types[T].HighBound Shr 16));
+    Root:=Types[T].Base;
+    For Temp:=1 To Length(Types[Root].IdentityUnit) Do Mix(Ord(Types[Root].IdentityUnit[Temp]));
+    For Temp:=1 To Length(Types[Root].IdentityName) Do Mix(Ord(Types[Root].IdentityName[Temp]));
+   End;
+  End;
   T:=SymbolType(I);
   If WithTypes And (T<>0) Then Begin
    Mix(Types[T].Width); Mix(Types[T].Capacity); Mix(Ord(Types[T].Signed));
@@ -2405,7 +2592,7 @@ Begin
 End;
 
 Function InterfaceChecksum(U: Byte): Word;
-Begin InterfaceChecksum:=InterfaceChecksumMode(U,True) End;
+Begin InterfaceChecksum:=InterfaceChecksumMode(U,True,True) End;
 
 Function RuntimeNumber(Target: Word): Word;Begin
  If Target=RuntimeUnsigned Then RuntimeNumber:=221 Else
@@ -2455,7 +2642,7 @@ Var
  N: NameStr;
  Ext: ExtStr;
  NativeConstants: Boolean;
- MetadataCount: Word;
+ MetadataCount,J: Word;
 
 Procedure PutByte(X: Byte);Begin
  If Posn>=MaxImage Then Fail(123,'Dictionnaire TPU trop grand');
@@ -2555,7 +2742,7 @@ Begin
  FillChar(SymbolEntries,SizeOf(SymbolEntries),0);
  FillChar(Stubs,SizeOf(Stubs),0);
  H.Signature[0]:='T'; H.Signature[1]:='P'; H.Signature[2]:='U'; H.Signature[3]:='9';
- H.Flags:=$8000; H.Reserved[0]:=$5054; H.Reserved[1]:=$3143; H.Reserved[2]:=2;
+ H.Flags:=$8000; H.Reserved[0]:=$5054; H.Reserved[1]:=$3143; H.Reserved[2]:=3;
  Units[U].Checksum:=InterfaceChecksum(U);
  Posn:=80; H.Interf:=Posn; PutWord(126);
  For I:=1 To 64 Do PutWord(0);
@@ -2622,7 +2809,7 @@ Begin
  skProc:
  Begin
   A:=SymbolEntry(Symbols[I].Name,83); MapStubs[I]:=A+4+Length(Symbols[I].Name);
-  PutByte(0); PutByte(0); PutWord(0); PutWord(0); PutWord(0); PutWord(0);
+  PutByte(Ord(Symbols[I].FarRoutine)); PutByte(0); PutWord(0); PutWord(0); PutWord(0); PutWord(0);
   PutByte(ttProc); PutByte(0); PutWord(0); PutWord(0);
   PutWord(0); PutWord(0); PutWord(0);
  End;
@@ -2640,6 +2827,16 @@ If Not NativeConstants Then Begin
  PutWord(MetadataCount);
  For I:=1 To SymbolCount Do If (SymbolEntries[I]<>0) And (SymbolType(I)<>0) Then Begin
   PutWord(SymbolEntries[I]); PutWord(SymbolType(I));
+ End;
+ MetadataCount:=0;
+ For I:=1 To SymbolCount Do If (SymbolEntries[I]<>0) And (Symbols[I].Kind=skProc) Then Inc(MetadataCount);
+ PutWord(MetadataCount);
+ For I:=1 To SymbolCount Do If (SymbolEntries[I]<>0) And (Symbols[I].Kind=skProc) Then Begin
+  PutWord(SymbolEntries[I]); PutWord(Symbols[I].ParamCount); PutWord(Symbols[I].ParamBytes);
+  PutWord(Ord(Symbols[I].FarRoutine));
+  For J:=1 To Symbols[I].ParamCount Do Begin
+   PutWord(Symbols[I].ParamTypeIds[J]); PutWord(Symbols[I].ParamFlags[J]);
+  End;
  End;
 End;
 If Odd(Posn) Then PutByte(0);
@@ -2990,7 +3187,7 @@ Begin
  Units[U].Checksum:=ReadWord(A+2);
  IsLocal:=(H.Flags=$8000) And (H.Reserved[0]=$5054) And (H.Reserved[1]=$3143);
  ProjectForeign:=Not IsLocal;
-  If IsLocal And Not (H.Reserved[2] In [1,2]) Then Fail(72,'Version du profil TPC1 inconnue');
+  If IsLocal And Not (H.Reserved[2] In [1,2,3]) Then Fail(72,'Version du profil TPC1 inconnue');
  If IsLocal Then Begin
   W:=0;
   For X:=80 To Size-1 Do W:=((W Shl 1) Or (W Shr 15))+B^[X];
@@ -3115,6 +3312,7 @@ Begin
      Target:=ReadWord(H.ProcMap+Map+6);
      If Target>=H.CodeSize Then Fail(72,'Procedure TPU hors code');
      Symbols[I].Kind:=skProc; Symbols[I].HasBody:=True;
+    Symbols[I].LegacyCall:=H.Reserved[2]<3;
      Symbols[I].Addr:=Units[U].CodeBase+Target;
     End Else
     Begin
@@ -3128,7 +3326,7 @@ Begin
       End Else
       Begin
        DictBounds(Stub+4,4); Value:=ReadWord(Stub+4);
-              If IsLocal And (H.Reserved[2]=2) Then Begin
+              If IsLocal And (H.Reserved[2]>=2) Then Begin
                 Move(B^[Stub+4],Value,4);
                 If (Value<-32768) Or (Value>65535) Then Fail(72,'Constante locale hors 16 bits');
               End Else If Width=4 Then Begin
@@ -3164,7 +3362,7 @@ Begin
    A:=Next;
   End;
  End;
-  If IsLocal And (H.Reserved[2]=2) Then Begin
+  If IsLocal And (H.Reserved[2]>=2) Then Begin
     MetaPos:=H.Reserved[5]; DictBounds(MetaPos,2); DiskCount:=ReadWord(MetaPos); Inc(MetaPos,2);
     If (DiskCount<7) Or (DiskCount>MaxTypes) Then Fail(72,'Table des types TPU invalide');
     DictBounds(MetaPos,Longint(DiskCount)*SizeOf(TTypeInfo));
@@ -3219,9 +3417,34 @@ Begin
       If I=0 Then Fail(72,'Metadonnees de symbole TPU inconnues');
       ApplyType(I,TypeMap[TIndex]);
     End;
+    If H.Reserved[2]=3 Then Begin
+     DictBounds(MetaPos,2); MetaCount:=ReadWord(MetaPos); Inc(MetaPos,2);
+     If MetaCount>MaxSymbols Then Fail(72,'Trop de signatures TPU');
+     For K:=1 To MetaCount Do Begin
+      DictBounds(MetaPos,8); A:=ReadWord(MetaPos); W:=SymbolStub(A);
+      Name:=Upper(ReadString(A+3)); I:=FindOwnSymbol(Name);
+      If (I=0) Or (Symbols[I].Kind<>skProc) Then Fail(72,'Signature TPU hors procedure');
+      ParamN:=ReadWord(MetaPos+2);
+      If ParamN>MaxNativeParams Then Fail(72,'Signature TPU trop longue');
+      Symbols[I].ParamCount:=ParamN; Symbols[I].ParamBytes:=ReadWord(MetaPos+4);
+      If ReadWord(MetaPos+6)>1 Then Fail(72,'Distance de routine TPU invalide');
+      Symbols[I].FarRoutine:=ReadWord(MetaPos+6)=1; Inc(MetaPos,8);
+      DictBounds(MetaPos,Longint(ParamN)*4); MapSum:=0;
+      For J:=1 To ParamN Do Begin
+       TIndex:=ReadWord(MetaPos); W:=ReadWord(MetaPos+2); Inc(MetaPos,4);
+       If (TIndex=0) Or (TIndex>DiskCount) Or Not (W In [2,6]) Then Fail(72,'Parametre TPU invalide');
+       TIndex:=TypeMap[TIndex];
+       If Not (Types[TIndex].Typ In [ttInteger,ttBoolean,ttChar,ttEnum]) Then Fail(72,'Type parametre TPU');
+       Symbols[I].ParamTypeIds[J]:=TIndex; Symbols[I].ParamFlags[J]:=W;
+       Symbols[I].ParamTypes[J]:=Types[TIndex].Typ; Symbols[I].ParamWidths[J]:=Types[TIndex].Width;
+       If W=6 Then Inc(MapSum,4) Else Inc(MapSum,2);
+      End;
+      If MapSum<>Symbols[I].ParamBytes Then Fail(72,'Taille parametres TPU incoherente');
+     End;
+    End;
   End;
   Units[U].InterfaceReady:=True;
-  If IsLocal And (InterfaceChecksumMode(U,H.Reserved[2]=2)<>Units[U].Checksum) Then Begin
+  If IsLocal And (InterfaceChecksumMode(U,H.Reserved[2]>=2,H.Reserved[2]=3)<>Units[U].Checksum) Then Begin
     { L'ordre des buckets differe de l'ordre des declarations: le checksum
       est verifie par la representation canonique triee ci-dessous. }
   Fail(72,'Checksum d''interface TPU invalide');
@@ -3597,15 +3820,16 @@ Begin
  Emit($B8); DataAddress(FalseText); PatchJump(Q,CodeSize);
  JumpTo(RuntimeString);
  RuntimeCopy:=CodeSize;      { DS:SI source, ES:DI dest, CX capacite }
+ Emit($06); Emit($1E); Emit($07); { ES=DS, restaurer l'ES de l'appelant }
  Emit2($31,$C0); Emit($AC); Emit2($39,$C8); Emit2($76,$02);
- Emit2($89,$C8); Emit($AA); Emit2($89,$C1); Emit2($F3,$A4); Emit($C3);
+ Emit2($89,$C8); Emit($AA); Emit2($89,$C1); Emit2($F3,$A4); Emit($07); Emit($C3);
  RuntimeHalt:=CodeSize; Emit2($B4,$4C); Emit2($CD,$21);
  For P:=1 To 16 Do Emit($90);
 End;
 
 Procedure CompileProgram;
 Var
- I: Byte;
+ I: Word;
 Begin
  CodeSize:=0; DataSize:=0; SymbolCount:=0; FixupCount:=0;
  InitTypes; ScopeCount:=0; CurrentScope:=0; FillChar(Dictionary,SizeOf(Dictionary),0);
@@ -3640,6 +3864,8 @@ Begin
  ImportLibrarySystem;
  UsesClause;
  DeclarationPart;
+  For I:=1 To SymbolCount Do If (Symbols[I].Owner=0) And (Symbols[I].Scope=0) And
+    (Symbols[I].Kind=skProc) And Not Symbols[I].HasBody Then Fail(59,Symbols[I].Name);
  MainEntry:=CodeSize;
  PatchJump(EntryFixup,CodeSize);
  For I:=1 To InitCount Do CallTo(Units[InitOrder[I]].InitAddress);
@@ -3789,6 +4015,7 @@ Procedure Help;Begin
  WriteLn('Toutes les chaines internes sont string[255] (longueur en [0]).');
   WriteLn('Types: alias, enums, sous-intervalles, Word/Shortint, string[n].');
   WriteLn('Constantes calculees/typees; procedures imbriquees, locaux ordinaux sur pile.');
+  WriteLn('Appels Pascal: parametres valeur/var ordinaux, fonctions, forward, near/far et $F.');
  WriteLn('Pas de compatibilite binaire promise avec le code Borland.');
 End;
 
