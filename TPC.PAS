@@ -1,4 +1,12 @@
-program TPC;
+{ @author: Sylvain Maltais (support@gladir.com)
+  @created: 2026
+  @website(https://www.gladir.com/turbopascal6-0)
+  @abstract(Target: Free Pascal)
+  @description: Clone du compilateur Turbo Pascal 6.0
+}
+
+Program TPC;
+
 { Portage partiel, et NON un remplacement integral de Turbo Pascal 6.
   Reference: N:\IBMPC\CODER\TurboPascalSource\COMPILER (VER60 / TPU9).
   Les tokens, NeedToken, CalcHash et les structures TPU ci-dessous suivent
@@ -27,9 +35,9 @@ program TPC;
 {$ENDIF}
 {$R-}{$Q-}
 
-uses Dos;
+Uses Dos;
 
-const
+Const
   MaxSource = 60000;
   MaxImage = 60000;
   MaxSymbols = 512;
