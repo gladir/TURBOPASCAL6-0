@@ -11,12 +11,15 @@ program TPC;
   /B recompile les sources et produit des fichiers TPU. Unites de code:
   profil TPU9/TPC1 marque, ABI locale near, incompatible ABI Borland.
   Unites autonomes de constantes seules: layout TPU9 sans extension.
+  TURBO.TPL: index TPU9 concatene, lecture directe par tranche, import des
+  constantes Borland. Le code et les initialisations Borland restent non lies.
   La compatibilite avec le linker Borland n'a pas ete validee.
   Les fonctionnalites manquantes ont un diagnostic propre sans faux numero TP.
   Numeros verifies dans le source et dans la table du TPC.EXE original DISK1.
   Les messages anglais ci-dessous couvrent les erreurs utilisees ici; les
   details supplementaires sont locaux, les positions ne sont pas garanties
   identiques a Borland. }
+{$A-}
 {$IFDEF FPC}
 {$MODE TP}
 {$H-}
@@ -32,6 +35,7 @@ const
   MaxFixups = 4096;
   MaxDefines = 128;
   MaxUnits = 64;
+  MaxLibraryUnits = 256;
   tkEOF=0; tkIdent=1; tkConstant=2;
   tkPlus=3; tkMinus=4; tkTimes=5; tkSlash=6; tkEqual=7;
   tkNE=8; tkGreater=9; tkLess=10; tkGE=11; tkLE=12;
@@ -50,7 +54,7 @@ const
   ttVoid=0; ttArray=1; ttRecord=2; ttObject=3; ttFile=4; ttText=5;
   ttProc=6; ttSet=7; ttPointer=8; ttString=9; tt8087=10;
   ttReal=11; ttInteger=12; ttBoolean=13; ttChar=14; ttEnum=15;
-  skVar=1; skConst=2; skProc=3;
+  skVar=1; skConst=2; skProc=3; skForeign=4;
 
 type
   TShortString = string[255];
@@ -102,6 +106,12 @@ type
     DependencyChecks: array[1..MaxUnits] of Word;
     Checksum: Word;
     CodeBase, DataBase: Word;
+    LibraryEntry: Word;
+  end;
+  TLibraryEntry = record
+    Name: string[63];
+    Offset, Size: Longint;
+    Header: TUnitHeader;
   end;
   TBinaryBuffer = array[0..262143] of Byte;
   PBinaryBuffer = ^TBinaryBuffer;
@@ -145,6 +155,9 @@ var
   CodeSize, DataSize, SymbolCount, FixupCount, DefineCount: Word;
   CondDepth: Byte;
   SourceName, OutputDir, UnitDirs, InputName, InspectName: TShortString;
+  TurboDirs, LibraryName, InspectLibraryName: TShortString;
+  LibraryUnits: array[1..MaxLibraryUnits] of TLibraryEntry;
+  LibraryCount: Word;
   OptionBits, StackSize, MinHeap, MaxHeap: Word;
   BuildMode, MakeMode, Quiet, InProcedure: Boolean;
   EntryFixup, RuntimeString, RuntimeInteger, RuntimeChar: Word;
@@ -636,7 +649,7 @@ begin
   end;
   Inc(ImportCount); ImportOrder[ImportCount]:=U;
   Imports:=Imports+[U];
-  if CurrentUnit<>0 then
+  if (CurrentUnit<>0) and (Units[U].Name<>'SYSTEM') then
     Units[CurrentUnit].Dependencies:=Units[CurrentUnit].Dependencies+[U];
 end;
 
@@ -655,6 +668,9 @@ begin
   if Token<>tkDot then begin
     I:=FindSymbol(Name);
     if I=0 then Fail(3,'Identificateur inconnu: '+Name);
+    if Symbols[I].Kind=skForeign then
+      Unsupported('symbole TPL '+Units[Symbols[I].Owner].Name+'.'+Name+
+        ': type ou ABI Borland non pris en charge');
     ResolveSymbol:=I; Exit;
   end;
   U:=FindBuildUnit(Name);
@@ -666,6 +682,9 @@ begin
   for I:=1 to SymbolCount do
     if (Symbols[I].Owner=U) and (Symbols[I].Name=TokenText) and
       (Symbols[I].Exported or (U=CurrentUnit)) then begin
+      if Symbols[I].Kind=skForeign then
+        Unsupported('symbole TPL '+Name+'.'+TokenText+
+          ': type ou ABI Borland non pris en charge');
       ResolveSymbol:=I; NextToken; Exit;
     end;
   Fail(3,'Identificateur inconnu: '+Name+'.'+TokenText);
@@ -1090,6 +1109,7 @@ end;
 
 procedure LoadSource; forward;
 procedure UsesClause; forward;
+procedure ImportLibrarySystem; forward;
 
 procedure SaveParser(var P: PParserState);
 begin
@@ -1140,6 +1160,7 @@ begin
   OptionBits:=InitialOptions;
   LoadSource;
   if not Quiet then WriteLn('Building unit ',Units[U].Name,': ',Path);
+  ImportLibrarySystem;
   NextToken; Need(tkUnit);
   if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
   if TokenText<>Units[U].Name then Fail(69,Units[U].Name+' <> '+TokenText);
@@ -1164,10 +1185,18 @@ begin
   RestoreParser(P);
 end;
 
+procedure OpenBinaryRead(var F: file; var E: Integer);
+var SavedMode: Byte;
+begin
+  SavedMode:=FileMode; FileMode:=0;
+  {$I-} Reset(F,1); E:=IOResult; {$I+}
+  FileMode:=SavedMode;
+end;
+
 function FileExists(S: TShortString): Boolean;
 var F: file; E: Integer;
 begin
-  Assign(F,S); {$I-} Reset(F,1); E:=IOResult; {$I+}
+  Assign(F,S); OpenBinaryRead(F,E);
   FileExists:=E=0;
   if E=0 then begin {$I-} Close(F); E:=IOResult; {$I+} end;
 end;
@@ -1191,9 +1220,9 @@ begin
     if FileExists(Candidate) then begin FindUnitPath:=Candidate; Exit end;
   end;
   FSplit(SourceName,D,N,E); FSplit(MainSourceName,MainDir,N,E);
-  if Length(D)+Length(MainDir)+Length(UnitDirs)+4>255 then
+  if Length(D)+Length(MainDir)+Length(UnitDirs)+Length(TurboDirs)+5>255 then
     CLIError('Liste de recherche des unites trop longue');
-  S:=D+';'+MainDir+';.;'+UnitDirs;
+  S:=D+';'+MainDir+';.;'+UnitDirs+';'+TurboDirs;
   repeat
     P:=Pos(';',S);
     if P=0 then begin Part:=S; S:='' end
@@ -1203,26 +1232,117 @@ begin
   until S='';
 end;
 
-procedure ReadTPUHeader(Name: TShortString; var H: TUnitHeader);
-var F: file; Count: Word; E: Integer; Size, Needed: Longint;
+function Align16(N: Longint): Longint;
+begin Align16:=(N+15) and not Longint(15) end;
+
+function UnitFileSize(var H: TUnitHeader): Longint;
 begin
-  Assign(F,Name); {$I-} Reset(F,1); E:=IOResult; {$I+}
-  if E<>0 then Fail(15,'Fichier introuvable: '+Name);
-  {$I-} Size:=FileSize(F); BlockRead(F,H,SizeOf(H),Count); E:=IOResult;
-  Close(F); if IOResult<>0 then E:=1; {$I+}
-  if (E<>0) or (Count<>SizeOf(H)) then Fail(72,'Unite tronquee: '+Name);
+  UnitFileSize:=Align16(H.EndTrace)+Align16(H.CodeSize)+Align16(H.ConstSize)+
+    Align16(H.CodeFixupSize)+Align16(H.DataFixupSize);
+end;
+
+procedure ValidateUnitHeader(Name: TShortString; Limit: Longint; var H: TUnitHeader);
+begin
   if (H.Signature[0]<>'T') or (H.Signature[1]<>'P') or
     (H.Signature[2]<>'U') or (H.Signature[3]<>'9') then
     Fail(72,'Signature TPU9 attendue: '+Name);
-  Needed:=((Longint(H.EndTrace)+15) div 16)*16;
-  Needed:=Needed+((Longint(H.CodeSize)+15) div 16)*16;
-  Needed:=Needed+((Longint(H.ConstSize)+15) div 16)*16;
-  Needed:=Needed+((Longint(H.CodeFixupSize)+15) div 16)*16;
-  Needed:=Needed+((Longint(H.DataFixupSize)+15) div 16)*16;
-  if (H.EndTrace<SizeOf(H)) or (Needed>Size) or
+  if (H.EndTrace<SizeOf(H)) or (UnitFileSize(H)>Limit) or
     (H.Name<SizeOf(H)) or (H.Name>=H.EndTrace) or
     (H.Interf<SizeOf(H)) or (H.Interf>=H.EndTrace) then
     Fail(72,'En-tete TPU incoherent: '+Name);
+end;
+
+procedure ReadUnitHeaderAt(Name: TShortString; Base, Limit: Longint; var H: TUnitHeader);
+var F: file; Count: Word; E: Integer; Size: Longint;
+begin
+  Assign(F,Name); OpenBinaryRead(F,E);
+  if E<>0 then Fail(15,'Fichier introuvable: '+Name);
+  {$I-} Size:=FileSize(F); E:=IOResult; {$I+}
+  if (E<>0) or (Base<0) or (Base>Size-SizeOf(H)) then begin
+    Close(F); Fail(72,'En-tete TPU/TPL hors fichier: '+Name);
+  end;
+  if Limit=0 then Limit:=Size-Base;
+  if (Limit<SizeOf(H)) or (Limit>Size-Base) then begin
+    Close(F); Fail(72,'Taille TPU/TPL incoherente: '+Name);
+  end;
+  {$I-} Seek(F,Base); BlockRead(F,H,SizeOf(H),Count); E:=IOResult;
+  Close(F); if IOResult<>0 then E:=1; {$I+}
+  if (E<>0) or (Count<>SizeOf(H)) then Fail(72,'Unite tronquee: '+Name);
+  ValidateUnitHeader(Name,Limit,H);
+end;
+
+procedure ReadTPUHeader(Name: TShortString; var H: TUnitHeader);
+begin ReadUnitHeaderAt(Name,0,0,H) end;
+
+function FindLibraryUnit(Name: TShortString): Word;
+var I: Word;
+begin
+  FindLibraryUnit:=0;
+  for I:=1 to LibraryCount do if LibraryUnits[I].Name=Name then begin
+    FindLibraryUnit:=I; Exit;
+  end;
+end;
+
+procedure ReadLibrary(Name: TShortString);
+var F: file; H: TUnitHeader; Base, Size, Span: Longint;
+    Prefix: TSymbolPrefix; S: TShortString; Count: Word; E, I: Integer;
+begin
+  LibraryCount:=0; LibraryName:=Name;
+  Assign(F,Name); OpenBinaryRead(F,E);
+  if E<>0 then Fail(15,'Bibliotheque introuvable: '+Name);
+  Size:=FileSize(F);
+  if Size=0 then begin Close(F); Fail(72,'Bibliotheque TPL vide: '+Name) end;
+  Base:=0;
+  while Base<Size do begin
+    if Size-Base<SizeOf(H) then Fail(72,'En-tete TPL tronque: '+Name);
+    {$I-} Seek(F,Base); BlockRead(F,H,SizeOf(H),Count); E:=IOResult; {$I+}
+    if (E<>0) or (Count<>SizeOf(H)) then Fail(72,'En-tete TPL illisible: '+Name);
+    ValidateUnitHeader(Name,Size-Base,H); Span:=UnitFileSize(H);
+    if (H.Interf>=H.ProcMap) or (H.ProcMap>H.CodeMap) or
+      (H.CodeMap>H.ConstMap) or (H.ConstMap>H.DataMap) or
+      (H.DataMap>H.EndMaps) or (H.EndMaps>H.Units) or
+      (H.Units>H.Sources) or (H.Sources>H.Trace) or
+      (H.Trace>H.EndTrace) or (H.Name+Longint(SizeOf(Prefix))>H.ProcMap) then
+      Fail(72,'Sections TPL incoherentes: '+Name);
+    {$I-} Seek(F,Base+H.Name); BlockRead(F,Prefix,SizeOf(Prefix),Count); E:=IOResult; {$I+}
+    if (E<>0) or (Count<>SizeOf(Prefix)) or (Prefix.Typ<>89) or
+      (Prefix.NameLength=0) or (Prefix.NameLength>63) or
+      (H.Name+Longint(SizeOf(Prefix))+Prefix.NameLength+8>H.ProcMap) then
+      Fail(72,'Nom d''unite TPL invalide: '+Name);
+    S:=''; S[0]:=Chr(Prefix.NameLength);
+    {$I-} BlockRead(F,S[1],Prefix.NameLength,Count); E:=IOResult; {$I+}
+    if (E<>0) or (Count<>Prefix.NameLength) then Fail(72,'Nom TPL tronque');
+    S:=Upper(S);
+    for I:=1 to Length(S) do
+      if not (S[I] in ['A'..'Z','_','0'..'9']) then Fail(72,'Identificateur TPL invalide');
+    if S[1] in ['0'..'9'] then Fail(72,'Identificateur TPL invalide');
+    if FindLibraryUnit(S)<>0 then Fail(72,'Unite TPL dupliquee: '+S);
+    if LibraryCount=MaxLibraryUnits then Unsupported('plus de 256 unites TPL');
+    Inc(LibraryCount); LibraryUnits[LibraryCount].Name:=S;
+    LibraryUnits[LibraryCount].Offset:=Base; LibraryUnits[LibraryCount].Size:=Span;
+    LibraryUnits[LibraryCount].Header:=H;
+    Inc(Base,Span);
+  end;
+  {$I-} Close(F); E:=IOResult; {$I+}
+  if E<>0 then Fail(72,'Erreur de lecture TPL');
+end;
+
+procedure FindAndReadLibrary;
+var D: DirStr; N: NameStr; E: ExtStr; S, Part, Candidate: TShortString; P: Integer;
+begin
+  LibraryCount:=0; LibraryName:='';
+  FSplit(FExpand(ParamStr(0)),D,N,E);
+  if Length(TurboDirs)+Length(D)+4>255 then CLIError('Liste de recherche TPL trop longue');
+  S:='.;'+TurboDirs+';'+D;
+  repeat
+    P:=Pos(';',S);
+    if P=0 then begin Part:=S; S:='' end
+    else begin Part:=Copy(S,1,P-1); Delete(S,1,P) end;
+    if Part<>'' then begin
+      Candidate:=JoinPath(Part,'TURBO.TPL');
+      if FileExists(Candidate) then begin ReadLibrary(Candidate); Exit end;
+    end;
+  until S='';
 end;
 
 { Profil TPU9/TPC1: conteneur TPU9 et structures historiques, mais ABI locale
@@ -1230,9 +1350,6 @@ end;
   Ces fichiers ne sont PAS annonces compatibles avec le linker Borland.
   Les fixups code $4000 sont relatifs IP, $8000 absolus DS; Map=$FFFF
   designe une routine du runtime local. Aucun pointeur hote sur disque. }
-function Align16(N: Longint): Longint;
-begin Align16:=(N+15) and not Longint(15) end;
-
 function LocalOffset(Target: Word; U: Byte; IsCode: Boolean): Word;
 var I, N: Word;
 begin
@@ -1387,7 +1504,7 @@ begin
   { Cas natif sans code ni dependance utilisateur: les constantes utilisent
     directement les types SYSTEM historiques. La compatibilite du layout
     est testee; une validation avec le linker Borland reste necessaire. }
-  NativeConstants:=UnitOutput and (UnitCount=1) and (U=1) and
+  NativeConstants:=UnitOutput and (U=1) and
     not Units[U].HasInit and (Units[U].Dependencies=[]);
   for I:=1 to SymbolCount do if (Symbols[I].Owner=U) and
     (Symbols[I].Kind<>skConst) then NativeConstants:=False;
@@ -1562,7 +1679,7 @@ end;
 
 procedure LoadCompiledUnit(U: Byte; Path: TShortString); forward;
 procedure RequireUnit(Name: TShortString; var U: Byte);
-var Path: TShortString;
+var Path: TShortString; Entry: Word;
 begin
   U:=FindBuildUnit(Name);
   if U<>0 then begin
@@ -1571,10 +1688,13 @@ begin
     Exit;
   end;
   if UnitCount=MaxUnits then Unsupported('plus de 64 unites');
-  Path:=''; if BuildMode then Path:=FindUnitPath(Name,'.PAS');
+  Entry:=FindLibraryUnit(Name);
+  Path:=''; if (Entry=0) and BuildMode then Path:=FindUnitPath(Name,'.PAS');
   Inc(UnitCount); U:=UnitCount; FillChar(Units[U],SizeOf(TBuildUnit),0);
   Units[U].Name:=Name; Units[U].State:=1;
-  if Path<>'' then CompileSourceUnit(U,Path)
+  Units[U].LibraryEntry:=Entry;
+  if Entry<>0 then LoadCompiledUnit(U,LibraryName)
+  else if Path<>'' then CompileSourceUnit(U,Path)
   else begin
     Path:=FindUnitPath(Name,'.TPU');
     if Path='' then Fail(15,'Fichier introuvable: '+Name+'.TPU');
@@ -1584,10 +1704,10 @@ end;
 
 procedure LoadCompiledUnit(U: Byte; Path: TShortString);
 var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
-    Size, Count, CodeStart, DataStart, RelStart, X: Longint;
+  Size, Base, Count, CodeStart, DataStart, RelStart, X: Longint;
     A, Stub, I, J, Bucket, Next, Steps, W, R, Map, Target: Word;
     V, Typ, Width, Capacity, Kind: Byte;
-    IsLocal: Boolean; Name: TShortString;
+    IsLocal, ProjectForeign, TypeSupported: Boolean; Name: TShortString;
     RefOffsets, RefChecks: array[0..MaxUnits+1] of Word;
     RefUnits: array[0..MaxUnits+1] of Byte;
     RefCount: Integer; E: Integer; Value: Longint;
@@ -1634,12 +1754,17 @@ var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
   end;
   procedure DecodeType(P: Word);
   var T, S, Addr, StubAddr, Limit: Word; UnitName: TShortString;
+    procedure Reject(S: TShortString);
+    begin
+      if ProjectForeign then TypeSupported:=False else Unsupported(S);
+    end;
   begin
+    TypeSupported:=True;
     DictBounds(P,4); T:=ReadWord(P); S:=ReadWord(P+2);
     Width:=0; Capacity:=0;
     if S=SymbolStub(H.Name) then begin
       DictBounds(T,6); Typ:=B^[T]; W:=ReadWord(T+2);
-      if (Typ<>ttString) and (W>4) then Unsupported('taille de type TPU');
+      if (Typ<>ttString) and (W>4) then begin Reject('taille de type TPU'); Exit end;
       Width:=W;
       if Typ=ttString then begin
         W:=ReadWord(T+2);
@@ -1648,7 +1773,7 @@ var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
       end;
       if (Typ=ttInteger) and not (Width in [1,2]) and
         not ((Kind=80) and (Width=4) and not IsLocal) then
-        Unsupported('type entier TPU > 16 bits');
+        begin Reject('type entier TPU > 16 bits'); Exit end;
     end else begin
       { Les pointeurs disque originaux referencent un symbole d'unite,
         pas un segment hote. Types SYSTEM standards dans COMPILER.INC. }
@@ -1660,7 +1785,7 @@ var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
         Addr:=ReadWord(StubAddr+4);
       end;
       if UnitName='' then Fail(72,'Segment du type TPU invalide');
-      if UnitName<>'SYSTEM' then Unsupported('type d''une autre unite TPU');
+      if UnitName<>'SYSTEM' then begin Reject('type d''une autre unite TPU'); Exit end;
       case T of
         $A0:begin Typ:=ttString; Capacity:=255 end;
         $DE:begin Typ:=ttInteger; Width:=1 end;
@@ -1668,23 +1793,30 @@ var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
         $114:begin Typ:=ttInteger; Width:=4 end;
         $130:begin Typ:=ttBoolean; Width:=1 end;
         $14C:begin Typ:=ttChar; Width:=1 end;
-      else Unsupported('type SYSTEM non pris en charge dans la TPU');
+      else begin Reject('type SYSTEM non pris en charge dans la TPU'); Exit end;
       end;
     end;
-    if not (Typ in [ttString,ttInteger,ttBoolean,ttChar]) then Unsupported('type TPU non pris en charge');
+    if not (Typ in [ttString,ttInteger,ttBoolean,ttChar]) then begin
+      Reject('type TPU non pris en charge'); Exit;
+    end;
     if (Typ in [ttChar,ttBoolean]) and (Width<>1) then Fail(72,'Taille ordinale TPU invalide');
   end;
 begin
-  ReadTPUHeader(Path,H);
+  Base:=0; Size:=0;
+  if Units[U].LibraryEntry<>0 then begin
+    Base:=LibraryUnits[Units[U].LibraryEntry].Offset;
+    Size:=LibraryUnits[Units[U].LibraryEntry].Size;
+  end;
+  ReadUnitHeaderAt(Path,Base,Size,H);
   SaveParser(P); CurrentUnit:=U; SourceName:=Path;
   TokenLine:=1; TokenColumn:=1; InInterface:=True; Imports:=[]; ImportCount:=0;
   Units[U].Path:=Path;
-  Assign(F,Path); {$I-} Reset(F,1); E:=IOResult; {$I+}
+  Assign(F,Path); OpenBinaryRead(F,E);
   if E<>0 then Fail(15,Path);
-  Size:=FileSize(F);
+  if Units[U].LibraryEntry=0 then Size:=FileSize(F);
   if (Size<80) or (Size>SizeOf(TBinaryBuffer)) then begin Close(F); Fail(72,'Taille TPU invalide') end;
   New(B);
-  {$I-} BlockRead(F,B^,Size,Count); E:=IOResult; Close(F);
+  {$I-} Seek(F,Base); BlockRead(F,B^,Size,Count); E:=IOResult; Close(F);
   if IOResult<>0 then E:=1; {$I+}
   if (E<>0) or (Count<>Size) then Fail(72,'Lecture TPU incomplete');
   if (H.Interf>=H.ProcMap) or (H.ProcMap>H.CodeMap) or
@@ -1698,13 +1830,14 @@ begin
   if Name<>Units[U].Name then Fail(69,Name+' <> '+Units[U].Name);
   Units[U].Checksum:=ReadWord(A+2);
   IsLocal:=(H.Flags=$8000) and (H.Reserved[0]=$5054) and (H.Reserved[1]=$3143);
+  ProjectForeign:=(Units[U].LibraryEntry<>0) and not IsLocal;
   if IsLocal and (H.Reserved[2]<>1) then Fail(72,'Version du profil TPC1 inconnue');
   if IsLocal then begin
     W:=0;
     for X:=80 to Size-1 do W:=((W shl 1) or (W shr 15))+B^[X];
     if W<>H.Reserved[4] then Fail(72,'Integrite de la TPU TPC1 invalide');
   end;
-  if not IsLocal and ((H.CodeSize<>0) or (H.ConstSize<>0) or
+  if not IsLocal and not ProjectForeign and ((H.CodeSize<>0) or (H.ConstSize<>0) or
     (H.DataSize<>0) or (H.CodeFixupSize<>0) or (H.DataFixupSize<>0)) then
     Unsupported('ABI Borland segmentee: seule TPU9 de constantes sans code est importable');
   CodeStart:=Align16(H.EndTrace); DataStart:=CodeStart+Align16(H.CodeSize);
@@ -1738,7 +1871,8 @@ begin
       Name:=Upper(ReadString(A+3));
       if Kind in [80,82,83] then begin
         I:=NewSymbol(Name);
-        if Kind=83 then begin
+        if ProjectForeign and (Kind<>80) then Symbols[I].Kind:=skForeign
+        else if Kind=83 then begin
           if not IsLocal then Unsupported('procedure TPU Borland');
           DictBounds(Stub,22);
           Map:=ReadWord(Stub+2);
@@ -1750,7 +1884,8 @@ begin
         end else begin
           if Kind=80 then begin
             Symbols[I].Kind:=skConst; DecodeType(Stub);
-            if Typ=ttString then begin
+            if not TypeSupported then Symbols[I].Kind:=skForeign
+            else if Typ=ttString then begin
               DictBounds(Stub+4,1); DictBounds(Stub+4,1+B^[Stub+4]);
               Symbols[I].StrValue:=ReadString(Stub+4);
               Symbols[I].Addr:=StoreString(Symbols[I].StrValue);
@@ -1758,7 +1893,10 @@ begin
               DictBounds(Stub+4,4); Value:=ReadWord(Stub+4);
               if Width=4 then begin
                 Move(B^[Stub+4],Value,4);
-                if (Value<-32768) or (Value>32767) then Unsupported('constante TPU Longint hors Integer');
+                if (Value<-32768) or (Value>32767) then begin
+                  if ProjectForeign then Symbols[I].Kind:=skForeign
+                  else Unsupported('constante TPU Longint hors Integer');
+                end;
                 Width:=2;
               end else if (Typ=ttInteger) and (Width=2) and (Value>32767) then Dec(Value,65536);
               if (Typ=ttBoolean) and (Value>1) then Fail(72,'Constante Boolean TPU invalide');
@@ -1775,7 +1913,10 @@ begin
           end;
           Symbols[I].Typ:=Typ; Symbols[I].Width:=Width; Symbols[I].Capacity:=Capacity;
         end;
-      end else if not (Kind in [89]) then Unsupported('categorie de symbole TPU');
+      end else if not (Kind in [89]) then begin
+        if ProjectForeign then begin I:=NewSymbol(Name); Symbols[I].Kind:=skForeign end
+        else Unsupported('categorie de symbole TPU');
+      end;
       A:=Next;
     end;
   end;
@@ -1833,8 +1974,20 @@ begin
   end;
   Units[U].State:=2;
   if Units[U].HasInit then begin Inc(InitCount); InitOrder[InitCount]:=U end;
-  if not Quiet then WriteLn('Loaded unit ',Units[U].Name,': ',Path);
+  if not Quiet then begin
+    Write('Loaded unit ',Units[U].Name,': ',Path);
+    if ProjectForeign then Write(' (constantes seulement; code/initialisation Borland non lies)');
+    WriteLn;
+  end;
   Dispose(B); RestoreParser(P);
+end;
+
+procedure ImportLibrarySystem;
+var U: Byte;
+begin
+  if FindLibraryUnit('SYSTEM')=0 then Exit;
+  if (CurrentUnit<>0) and (Units[CurrentUnit].Name='SYSTEM') then Exit;
+  RequireUnit('SYSTEM',U); AddImport(U);
 end;
 
 procedure UsesClause;
@@ -1845,7 +1998,7 @@ begin
   repeat
     if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
     Name:=TokenText; NextToken;
-    if Name<>'SYSTEM' then begin
+    if (Name<>'SYSTEM') or (FindLibraryUnit('SYSTEM')<>0) then begin
       RequireUnit(Name,U);
       AddImport(U);
     end;
@@ -1920,6 +2073,7 @@ begin
     end;
     Need(tkSemi);
   end;
+  ImportLibrarySystem;
   UsesClause;
   DeclarationPart;
   PatchJump(EntryFixup,CodeSize);
@@ -1932,7 +2086,7 @@ end;
 procedure LoadSource;
 var F: file; N: Word; E: Integer;
 begin
-  Assign(F,SourceName); {$I-} Reset(F,1); E:=IOResult; {$I+}
+  Assign(F,SourceName); OpenBinaryRead(F,E);
   if E<>0 then Fail(15,'Fichier introuvable: '+SourceName);
   SourceSize:=FileSize(F);
   if SourceSize>MaxSource then begin Close(F); Unsupported('source > 60000 octets') end;
@@ -1995,6 +2149,24 @@ begin
   else WriteLn('TPU9 Borland: import limite aux unites de constantes sans code.');
 end;
 
+procedure InspectLibrary;
+var I: Word; H: TUnitHeader;
+begin
+  ReadLibrary(InspectLibraryName);
+  WriteLn('TPL: ',LibraryName,'; unites=',LibraryCount);
+  for I:=1 to LibraryCount do begin
+    H:=LibraryUnits[I].Header;
+    Write(LibraryUnits[I].Name,' offset=',LibraryUnits[I].Offset,
+      ' taille=',LibraryUnits[I].Size,' code=',H.CodeSize,' constantes=',H.ConstSize);
+    if (H.Flags=$8000) and (H.Reserved[0]=$5054) and (H.Reserved[1]=$3143) then
+      Write(' profil=TPC1')
+    else if (H.CodeSize<>0) or (H.ConstSize<>0) or (H.DataSize<>0) then
+      Write(' Borland: projection constantes seulement')
+    else Write(' TPU9 sans code');
+    WriteLn;
+  end;
+end;
+
 procedure Help;
 begin
   WriteLn('TPC - portage PARTIEL de Turbo Pascal 6, cible DOS 8086');
@@ -2002,10 +2174,13 @@ begin
   WriteLn('/B reconstruit les unites depuis leurs sources (sous-ensemble Pascal).');
   WriteLn('Production/liaison TPU9 profil TPC1; ABI locale, pas ABI Borland.');
   WriteLn('Import TPU9 Borland limite aux unites de constantes sans code.');
+  WriteLn('TURBO.TPL Borland: constantes importees, routines/variables non liees.');
   WriteLn('/M reconnu, refuse: reconstruction incrementale non implementee.');
-  WriteLn('/Q silencieux; /T repertoire Turbo (cherche les TPU).');
+  WriteLn('/Q silencieux; /T repertoires Turbo (TURBO.TPL et TPU).');
+  WriteLn('TPL charge automatiquement: repertoire courant, /T, repertoire de TPC.');
   WriteLn('/I, /O, /L, /V, /F, /G reconnus mais refuses: fonctions manquantes.');
   WriteLn('Extension locale: --inspect-tpu=fichier.tpu; --quiet; --help.');
+  WriteLn('Extension locale: --inspect-tpl=fichier.tpl.');
   WriteLn('Toutes les chaines internes sont string[255] (longueur en [0]).');
   WriteLn('Pas de compatibilite binaire promise avec le code Borland.');
 end;
@@ -2019,6 +2194,7 @@ begin
     if (S='--help') or (S='/?') or (S='-?') then begin Help; Halt(0) end
     else if S='--quiet' then Quiet:=True
     else if Copy(S,1,14)='--inspect-tpu=' then InspectName:=Copy(S,15,255)
+    else if Copy(S,1,14)='--inspect-tpl=' then InspectLibraryName:=Copy(S,15,255)
     else if (Length(S)>0) and (S[1] in ['/','-']) then begin
       if Length(S)<2 then CLIError('Option vide');
       C:=UpCase(S[2]); Arg:=Copy(S,3,255);
@@ -2030,7 +2206,7 @@ begin
         end;
         'E':begin if Arg='' then CLIError('Repertoire /E manquant'); OutputDir:=Arg end;
         'U':begin if Arg='' then CLIError('Repertoire /U manquant'); UnitDirs:=Arg end;
-        'T':begin if Arg='' then CLIError('Repertoire /T manquant'); UnitDirs:=Arg end;
+        'T':begin if Arg='' then CLIError('Repertoire /T manquant'); TurboDirs:=Arg end;
         'Q':begin if Arg<>'' then CLIError('Option /Q incorrecte'); Quiet:=True end;
         'D':begin
           repeat
@@ -2076,11 +2252,13 @@ begin
   Define('VER60'); Define('MSDOS'); Define('CPU86');
   ParseArguments;
   if InspectName<>'' then begin SourceName:=InspectName; InspectTPU; Halt(0) end;
+  if InspectLibraryName<>'' then begin SourceName:=InspectLibraryName; InspectLibrary; Halt(0) end;
   if InputName='' then CLIError('Fichier source manquant');
   if MakeMode and not BuildMode then Unsupported('/M: construction incrementale des unites');
   SourceName:=InputName; FSplit(SourceName,D,N,E);
   if E='' then SourceName:=SourceName+'.PAS';
   MainSourceName:=SourceName;
+  FindAndReadLibrary;
   Move(Defines,InitialDefines,SizeOf(Defines)); InitialDefineCount:=DefineCount;
   InitialOptions:=OptionBits;
   if not Quiet then WriteLn('TPC: portage partiel TP6; hote Pascal, cible DOS 8086');
