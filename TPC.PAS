@@ -6,10 +6,12 @@ program TPC;
   produit n'est pas identique a celui de Borland. Aucun backend FPC externe.
   Hote valide: Free Pascal 3.2, mode TP, strings courts uniquement.
   Cible: DOS MZ, instructions 8086, un segment CS/DS et pile separee.
-  Restrictions explicites: pas de linker TPU/OBJ, real, tableaux, objets,
+  Restrictions explicites: pas de linker TPU Borland general/OBJ, real, tableaux, objets,
   types utilisateurs, procedures a parametres, routines imbriquees, ASM.
-  /B recompile recursivement les sources d'unites dans l'image EXE, sans
-  produire de TPU9. Les TPU sans source restent non liables.
+  /B recompile les sources et produit des fichiers TPU. Unites de code:
+  profil TPU9/TPC1 marque, ABI locale near, incompatible ABI Borland.
+  Unites autonomes de constantes seules: layout TPU9 sans extension.
+  La compatibilite avec le linker Borland n'a pas ete validee.
   Les fonctionnalites manquantes ont un diagnostic propre sans faux numero TP.
   Numeros verifies dans le source et dans la table du TPC.EXE original DISK1.
   Les messages anglais ci-dessous couvrent les erreurs utilisees ici; les
@@ -86,6 +88,7 @@ type
     StrValue: TShortString;
   end;
   TAddressFixup = record Position, DataOffset: Word end;
+  TRelativeFixup = record Position, Target: Word end;
   TCondition = record ParentActive, Test, SeenElse: Boolean end;
   TUnitSet = set of 0..MaxUnits;
   TBuildUnit = record
@@ -93,7 +96,15 @@ type
     State: Byte; { 1 = compilation en cours; 2 = compilee }
     InterfaceReady, HasInit: Boolean;
     InitAddress: Word;
+    FromSource: Boolean;
+    Path: TShortString;
+    Dependencies: TUnitSet;
+    DependencyChecks: array[1..MaxUnits] of Word;
+    Checksum: Word;
+    CodeBase, DataBase: Word;
   end;
+  TBinaryBuffer = array[0..262143] of Byte;
+  PBinaryBuffer = ^TBinaryBuffer;
   TSourceBuffer = array[1..MaxSource] of Char;
   PSourceBuffer = ^TSourceBuffer;
   PParserState = ^TParserState;
@@ -120,6 +131,9 @@ var
   Image, Data: array[0..MaxImage-1] of Byte;
   Symbols: array[1..MaxSymbols] of TSymbol;
   Fixups: array[1..MaxFixups] of TAddressFixup;
+  RelativeFixups: array[1..MaxFixups] of TRelativeFixup;
+  RelativeCount: Word;
+  CodeOwners, DataOwners: array[0..MaxImage-1] of Byte;
   Defines: array[1..MaxDefines] of string[63];
   Conditions: array[1..32] of TCondition;
   SourceSize, SourcePos: Longint;
@@ -146,6 +160,7 @@ var
   MainSourceName: TShortString;
   InitialDefines: array[1..MaxDefines] of string[63];
   InitialDefineCount, InitialOptions: Word;
+  UnitOutput: Boolean;
 
 function Upper(S: TShortString): TShortString;
 var I: Integer;
@@ -194,6 +209,7 @@ begin
     66:ErrorMessage:='String expression expected';
     68:ErrorMessage:='Circular unit reference';
     69:ErrorMessage:='Unit name mismatch';
+    70:ErrorMessage:='Unit version mismatch';
     72:ErrorMessage:='Unit file format error';
     73:ErrorMessage:='IMPLEMENTATION expected';
     76:ErrorMessage:='Constant out of range';
@@ -518,6 +534,7 @@ end;
 procedure Emit(B: Byte);
 begin
   if CodeSize=MaxImage then Fail(48,'Segment de code trop grand');
+  CodeOwners[CodeSize]:=CurrentUnit;
   Image[CodeSize]:=B; Inc(CodeSize);
 end;
 
@@ -534,7 +551,17 @@ function Jump: Word;
 begin Emit($E9); Jump:=CodeSize; EmitWord(0) end;
 
 procedure PatchJump(P, Target: Word);
-begin PatchWord(P,Word(Longint(Target)-P-2)) end;
+var I: Word;
+begin
+  PatchWord(P,Word(Longint(Target)-P-2));
+  if CodeOwners[P]=0 then Exit;
+  for I:=1 to RelativeCount do if RelativeFixups[I].Position=P then begin
+    RelativeFixups[I].Target:=Target; Exit;
+  end;
+  if RelativeCount=MaxFixups then Unsupported('trop de references de code');
+  Inc(RelativeCount); RelativeFixups[RelativeCount].Position:=P;
+  RelativeFixups[RelativeCount].Target:=Target;
+end;
 
 procedure JumpTo(Target: Word);
 var P: Word;
@@ -548,7 +575,8 @@ begin
 end;
 
 procedure CallTo(Target: Word);
-begin Emit($E8); EmitWord(Word(Longint(Target)-CodeSize-2)) end;
+var P: Word;
+begin Emit($E8); P:=CodeSize; EmitWord(0); PatchJump(P,Target) end;
 
 procedure LoadImmediate(W: Word);
 begin Emit($B8); EmitWord(W) end;
@@ -561,8 +589,10 @@ begin
 end;
 
 function AllocData(N: Word): Word;
+var I: Word;
 begin
   if Longint(DataSize)+N>MaxImage then Fail(49,'Segment de donnees trop grand');
+  if N<>0 then for I:=DataSize to DataSize+N-1 do DataOwners[I]:=CurrentUnit;
   AllocData:=DataSize; Inc(DataSize,N);
 end;
 
@@ -606,6 +636,8 @@ begin
   end;
   Inc(ImportCount); ImportOrder[ImportCount]:=U;
   Imports:=Imports+[U];
+  if CurrentUnit<>0 then
+    Units[CurrentUnit].Dependencies:=Units[CurrentUnit].Dependencies+[U];
 end;
 
 function FindBuildUnit(S: TShortString): Byte;
@@ -1100,6 +1132,7 @@ var P: PParserState; I: Word;
 begin
   SaveParser(P);
   SourceName:=Path; CurrentUnit:=U; Imports:=[]; ImportCount:=0;
+  Units[U].FromSource:=True; Units[U].Path:=Path;
   InInterface:=True; InProcedure:=False;
   { Les directives locales d'une unite ne fuient ni dans ses dependances
     ni dans le programme appelant. Les /D de la CLI restent disponibles. }
@@ -1113,6 +1146,7 @@ begin
   NextToken; Need(tkSemi); Need(tkInterface);
   UsesClause; DeclarationPart;
   Units[U].InterfaceReady:=True;
+  Units[U].Checksum:=0; { calcule apres compilation; sources /B prioritaires }
   Need(tkImplementation); InInterface:=False;
   UsesClause; DeclarationPart;
   for I:=1 to SymbolCount do
@@ -1191,8 +1225,620 @@ begin
     Fail(72,'En-tete TPU incoherent: '+Name);
 end;
 
+{ Profil TPU9/TPC1: conteneur TPU9 et structures historiques, mais ABI locale
+  near/CS=DS. Reserved[0..2] = 'TP','C1',1 et Flags=$8000 l'identifient.
+  Ces fichiers ne sont PAS annonces compatibles avec le linker Borland.
+  Les fixups code $4000 sont relatifs IP, $8000 absolus DS; Map=$FFFF
+  designe une routine du runtime local. Aucun pointeur hote sur disque. }
+function Align16(N: Longint): Longint;
+begin Align16:=(N+15) and not Longint(15) end;
+
+function LocalOffset(Target: Word; U: Byte; IsCode: Boolean): Word;
+var I, N: Word;
+begin
+  N:=0;
+  if Target<>0 then for I:=0 to Target-1 do begin
+    if IsCode then begin if CodeOwners[I]=U then Inc(N) end
+    else if DataOwners[I]=U then Inc(N);
+  end;
+  LocalOffset:=N;
+end;
+
+function GlobalOffset(Offset: Word; U: Byte; IsCode: Boolean): Word;
+var I, N, Limit, Last: Word;
+begin
+  if IsCode then Limit:=CodeSize else Limit:=DataSize;
+  N:=0; Last:=0;
+  if Limit<>0 then for I:=0 to Limit-1 do begin
+    if (IsCode and (CodeOwners[I]=U)) or (not IsCode and (DataOwners[I]=U)) then begin
+      if N=Offset then begin GlobalOffset:=I; Exit end;
+      Inc(N); Last:=I+1;
+    end;
+  end;
+  if IsCode and (N<>0) and (N=Offset) then begin GlobalOffset:=Last; Exit end;
+  Fail(72,'Offset hors section d''unite'); GlobalOffset:=0;
+end;
+
+function InterfaceChecksum(U: Byte): Word;
+var I, K, N, Temp: Word; J: Integer; H: Word;
+  Order: array[1..MaxSymbols] of Word;
+  procedure Mix(W: Word);
+  begin H:=((H shl 1) or (H shr 15))+W end;
+begin
+  H:=0; N:=0;
+  for I:=1 to SymbolCount do if (Symbols[I].Owner=U) and Symbols[I].Exported then begin
+    Inc(N); Order[N]:=I;
+  end;
+  for I:=2 to N do begin
+    K:=I;
+    while K>1 do begin
+      if Symbols[Order[K-1]].Name<Symbols[Order[K]].Name then Break;
+      Temp:=Order[K-1]; Order[K-1]:=Order[K]; Order[K]:=Temp; Dec(K);
+    end;
+  end;
+  for K:=1 to N do begin
+    I:=Order[K];
+    for J:=1 to Length(Symbols[I].Name) do Mix(Ord(Symbols[I].Name[J]));
+    Mix(Symbols[I].Kind); Mix(Symbols[I].Typ);
+    if Symbols[I].Kind=skConst then begin Mix(0); Mix(0) end
+    else begin Mix(Symbols[I].Width); Mix(Symbols[I].Capacity) end;
+    if Symbols[I].Kind=skConst then begin
+      Mix(Word(Symbols[I].Value));
+      for J:=0 to Length(Symbols[I].StrValue) do Mix(Ord(Symbols[I].StrValue[J]));
+    end;
+  end;
+  if H=0 then H:=$FFFF;
+  InterfaceChecksum:=H;
+end;
+
+function RuntimeNumber(Target: Word): Word;
+begin
+  if Target=RuntimeString then RuntimeNumber:=216
+  else if Target=RuntimeInteger then RuntimeNumber:=220
+  else if Target=RuntimeBoolean then RuntimeNumber:=224
+  else if Target=RuntimeChar then RuntimeNumber:=228
+  else if Target=RuntimeCopy then RuntimeNumber:=48
+  else begin Unsupported('reference de code hors unite'); RuntimeNumber:=0 end;
+end;
+
+function RuntimeAddress(N: Word): Word;
+begin
+  case N of
+    216:RuntimeAddress:=RuntimeString; 220:RuntimeAddress:=RuntimeInteger;
+    224:RuntimeAddress:=RuntimeBoolean; 228:RuntimeAddress:=RuntimeChar;
+    48:RuntimeAddress:=RuntimeCopy;
+  else begin Unsupported('routine du runtime TPU'); RuntimeAddress:=0 end;
+  end;
+end;
+
+procedure WriteCompiledUnit(U: Byte);
+var B: PBinaryBuffer; H: TUnitHeader; F: file;
+    Posn, I, A, TypAddr, Bucket, CheckPos, CodeLen, DataLen: Word;
+    FixLen, InitEntry, PayloadCheck: Word; V, TargetOwner: Byte;
+    Refs: array[0..MaxUnits] of Word;
+    Stubs: array[0..MaxUnits] of Word;
+    MapStubs: array[1..MaxSymbols] of Word;
+    FilePos, CodeStart, DataStart, RelStart: Longint;
+    Count: Longint; E: Integer; Path: TShortString;
+    D: DirStr; N: NameStr; Ext: ExtStr;
+    NativeConstants: Boolean;
+  procedure PutByte(X: Byte);
+  begin
+    if Posn>=MaxImage then Fail(123,'Dictionnaire TPU trop grand');
+    B^[Posn]:=X; Inc(Posn);
+  end;
+  procedure PutWord(X: Word);
+  begin PutByte(X and 255); PutByte(X shr 8) end;
+  procedure SetWord(P, X: Word);
+  begin B^[P]:=X and 255; B^[P+1]:=X shr 8 end;
+  function GetWord(P: Word): Word;
+  begin GetWord:=B^[P]+Word(B^[P+1])*256 end;
+  procedure PutString(S: TShortString);
+  var K: Integer;
+  begin PutByte(Length(S)); for K:=1 to Length(S) do PutByte(Ord(S[K])) end;
+  function SymbolEntry(S: TShortString; Kind: Byte): Word;
+  var P: Word;
+  begin
+    P:=Posn; Bucket:=H.Interf+2+(HashIdent(S) and 126);
+    PutWord(GetWord(Bucket)); SetWord(Bucket,P);
+    PutByte(Kind); PutString(S); SymbolEntry:=P;
+  end;
+  procedure UnitEntry(V: Byte; S: TShortString; Check: Word);
+  var Prev, P: Word;
+  begin
+    Prev:=Stubs[U];
+    if V<>U then begin
+      Prev:=H.Name;
+      while GetWord(Prev+4+B^[Prev+3]+4)<>0 do
+        Prev:=GetWord(Prev+4+B^[Prev+3]+4);
+    end;
+    A:=SymbolEntry(S,89); Stubs[V]:=A;
+    PutWord(0); PutWord(Check); PutWord(0); PutWord(0);
+    if V<>U then begin P:=Prev+4+B^[Prev+3]; SetWord(P+4,A) end;
+  end;
+  procedure Reloc(Position, Target: Word; IsData: Boolean);
+  var Flags, Number: Word;
+  begin
+    if IsData then begin
+      TargetOwner:=DataOwners[Target]; Flags:=$8000;
+      Number:=LocalOffset(Target,TargetOwner,False);
+    end else begin
+      { Un saut vers la fin du corps peut viser le premier octet suivant. }
+      if Target<CodeSize then TargetOwner:=CodeOwners[Target] else TargetOwner:=U;
+      Flags:=$4000;
+      Number:=LocalOffset(Target,TargetOwner,True);
+      if Image[Position-1]=$E9 then begin
+        TargetOwner:=U; Number:=LocalOffset(Target,U,True);
+      end;
+    end;
+    if (TargetOwner<>U) and (TargetOwner<>0) and
+      not (TargetOwner in Units[U].Dependencies) then
+      Unsupported('reference TPU vers une unite non declaree');
+    SetWord(Posn,Flags or Refs[TargetOwner]); Inc(Posn,2);
+    if not IsData and (TargetOwner=0) then begin
+      SetWord(Posn,$FFFF); Inc(Posn,2);
+      SetWord(Posn,RuntimeNumber(Target)); Inc(Posn,2);
+    end else begin
+      SetWord(Posn,0); Inc(Posn,2); SetWord(Posn,Number); Inc(Posn,2);
+    end;
+    SetWord(Posn,LocalOffset(Position,U,True)); Inc(Posn,2);
+  end;
+begin
+  { Cas natif sans code ni dependance utilisateur: les constantes utilisent
+    directement les types SYSTEM historiques. La compatibilite du layout
+    est testee; une validation avec le linker Borland reste necessaire. }
+  NativeConstants:=UnitOutput and (UnitCount=1) and (U=1) and
+    not Units[U].HasInit and (Units[U].Dependencies=[]);
+  for I:=1 to SymbolCount do if (Symbols[I].Owner=U) and
+    (Symbols[I].Kind<>skConst) then NativeConstants:=False;
+  New(B); FillChar(B^,SizeOf(TBinaryBuffer),0); FillChar(H,SizeOf(H),0);
+  FillChar(MapStubs,SizeOf(MapStubs),0); FillChar(Refs,SizeOf(Refs),0);
+  FillChar(Stubs,SizeOf(Stubs),0);
+  H.Signature[0]:='T'; H.Signature[1]:='P'; H.Signature[2]:='U'; H.Signature[3]:='9';
+  H.Flags:=$8000; H.Reserved[0]:=$5054; H.Reserved[1]:=$3143; H.Reserved[2]:=1;
+  Units[U].Checksum:=InterfaceChecksum(U);
+  Posn:=80; H.Interf:=Posn; PutWord(126);
+  for I:=1 to 64 do PutWord(0);
+  H.Name:=Posn;
+  if NativeConstants then UnitEntry(U,Units[U].Name,0)
+  else UnitEntry(U,Units[U].Name,Units[U].Checksum);
+  CheckPos:=H.Name+4+Length(Units[U].Name)+2;
+  UnitEntry(0,'SYSTEM',0);
+  for V:=1 to UnitCount do if V in Units[U].Dependencies then
+    UnitEntry(V,Units[V].Name,Units[V].Checksum);
+  { Types locaux: la partie segment reference le symbole d'unite. }
+  for I:=1 to SymbolCount do if (Symbols[I].Owner=U) and Symbols[I].Exported then begin
+    TypAddr:=Posn; PutByte(Symbols[I].Typ);
+    if Symbols[I].Typ=ttInteger then begin
+      if Symbols[I].Width=1 then PutByte(2) else PutByte(5);
+    end else PutByte(0);
+    if (Symbols[I].Typ=ttString) and (Symbols[I].Kind=skConst) then PutWord(256)
+    else if Symbols[I].Typ=ttString then PutWord(Word(Symbols[I].Capacity)+1)
+    else if Symbols[I].Kind=skConst then begin
+      if Symbols[I].Typ=ttInteger then PutWord(2) else PutWord(1);
+    end else PutWord(Symbols[I].Width);
+    PutWord(0);
+    if Symbols[I].Typ=ttInteger then begin
+      if Symbols[I].Width=1 then begin PutWord(0); PutWord(0); PutWord(255); PutWord(0) end
+      else begin PutWord($8000); PutWord($FFFF); PutWord($7FFF); PutWord(0) end;
+      PutWord(TypAddr); PutWord(H.Name+4+Length(Units[U].Name));
+    end;
+    case Symbols[I].Kind of
+      skConst:begin
+        A:=SymbolEntry(Symbols[I].Name,80);
+        if NativeConstants then begin
+          case Symbols[I].Typ of
+            ttInteger:PutWord($114); ttChar:PutWord($14C);
+            ttBoolean:PutWord($130); ttString:PutWord($A0);
+          end;
+          PutWord(Stubs[0]+4+6);
+        end else begin
+          PutWord(TypAddr); PutWord(H.Name+4+Length(Units[U].Name));
+        end;
+        if Symbols[I].Typ=ttString then PutString(Symbols[I].StrValue)
+        else begin
+          PutWord(Word(Symbols[I].Value));
+          if Symbols[I].Value<0 then PutWord($FFFF) else PutWord(0);
+        end;
+      end;
+      skVar:begin
+        A:=SymbolEntry(Symbols[I].Name,82); PutByte(0);
+        PutWord(LocalOffset(Symbols[I].Addr,U,False)); PutWord(0);
+        PutWord(TypAddr); PutWord(H.Name+4+Length(Units[U].Name));
+      end;
+      skProc:begin
+        A:=SymbolEntry(Symbols[I].Name,83); MapStubs[I]:=A+4+Length(Symbols[I].Name);
+        PutByte(0); PutByte(0); PutWord(0); PutWord(0); PutWord(0); PutWord(0);
+        PutByte(ttProc); PutByte(0); PutWord(0); PutWord(0);
+        PutWord(0); PutWord(0); PutWord(0);
+      end;
+    end;
+  end;
+  if Odd(Posn) then PutByte(0);
+  if NativeConstants then begin
+    PayloadCheck:=0; I:=H.Interf;
+    while I+1<Posn do begin
+      PayloadCheck:=((PayloadCheck shl 1) or (PayloadCheck shr 15))+GetWord(I);
+      Inc(I,2);
+    end;
+    if PayloadCheck=0 then PayloadCheck:=$FFFF;
+    SetWord(CheckPos,PayloadCheck); Units[U].Checksum:=PayloadCheck;
+  end;
+  H.ProcMap:=Posn;
+  InitEntry:=$FFFF;
+  if Units[U].HasInit then InitEntry:=LocalOffset(Units[U].InitAddress,U,True);
+  PutWord(0); PutWord(0);
+  if NativeConstants then begin PutWord($FFFF); PutWord(0) end
+  else begin PutWord(0); PutWord(InitEntry) end;
+  for I:=1 to SymbolCount do if MapStubs[I]<>0 then begin
+    SetWord(MapStubs[I]+2,Posn-H.ProcMap);
+    PutWord(MapStubs[I]); PutWord(0); PutWord(0);
+    PutWord(LocalOffset(Symbols[I].Addr,U,True));
+  end;
+  CodeLen:=LocalOffset(CodeSize,U,True); DataLen:=LocalOffset(DataSize,U,False);
+  if NativeConstants then begin CodeLen:=0; DataLen:=0 end;
+  FixLen:=0;
+  for I:=1 to FixupCount do if CodeOwners[Fixups[I].Position]=U then begin
+    if FixLen>MaxImage-8 then Unsupported('trop de fixups dans une unite');
+    Inc(FixLen,8);
+  end;
+  for I:=1 to RelativeCount do if CodeOwners[RelativeFixups[I].Position]=U then begin
+    if FixLen>MaxImage-8 then Unsupported('trop de fixups dans une unite');
+    Inc(FixLen,8);
+  end;
+  if Longint(Posn)+FixLen+1024>MaxImage then Unsupported('dictionnaire et fixups TPU trop grands');
+  H.CodeMap:=Posn;
+  if not NativeConstants then begin PutWord(0); PutWord(CodeLen); PutWord(FixLen); PutWord(0) end;
+  H.ConstMap:=Posn;
+  if not NativeConstants then begin PutWord(0); PutWord(DataLen); PutWord(0); PutWord(0) end;
+  H.DataMap:=Posn; H.EndMaps:=Posn; H.Units:=Posn;
+  Refs[U]:=0; PutWord(0); PutString(Units[U].Name);
+  Refs[0]:=Posn-H.Units; PutWord(0); PutString('SYSTEM');
+  for V:=1 to UnitCount do if V in Units[U].Dependencies then begin
+    Refs[V]:=Posn-H.Units; PutWord(0); PutString(Units[V].Name);
+  end;
+  H.Sources:=Posn; H.Trace:=Posn; H.EndTrace:=Posn; H.DebugHash:=H.Interf;
+  H.CodeSize:=CodeLen; H.ConstSize:=DataLen; H.CodeFixupSize:=FixLen;
+  H.Reserved[3]:=CheckPos; { profil: emplacement du checksum d'interface }
+  if NativeConstants then begin
+    H.Flags:=0; FillChar(H.Reserved,SizeOf(H.Reserved),0);
+  end;
+  CodeStart:=Align16(Posn); FilePos:=CodeStart;
+  for I:=0 to CodeSize-1 do if CodeOwners[I]=U then begin B^[FilePos]:=Image[I]; Inc(FilePos) end;
+  DataStart:=CodeStart+Align16(CodeLen); FilePos:=DataStart;
+  if not NativeConstants then
+    for I:=0 to DataSize-1 do if DataOwners[I]=U then begin B^[FilePos]:=Data[I]; Inc(FilePos) end;
+  RelStart:=DataStart+Align16(DataLen);
+  { Les fixups sont apres les deux sections; reutiliser un curseur Word
+    uniquement dans une zone temporaire puis copier vers le fichier. }
+  Posn:=H.EndTrace;
+  for I:=1 to FixupCount do if CodeOwners[Fixups[I].Position]=U then
+    Reloc(Fixups[I].Position,Fixups[I].DataOffset,True);
+  for I:=1 to RelativeCount do if CodeOwners[RelativeFixups[I].Position]=U then
+    Reloc(RelativeFixups[I].Position,RelativeFixups[I].Target,False);
+  Move(B^[H.EndTrace],B^[RelStart],FixLen);
+  { Effacer seulement la zone entre dictionnaire et code: elle avait servi
+    de temporaire et peut recouvrir le code. Celui-ci est reconstitue. }
+  FilePos:=CodeStart;
+  for I:=0 to CodeSize-1 do if CodeOwners[I]=U then begin B^[FilePos]:=Image[I]; Inc(FilePos) end;
+  FilePos:=DataStart;
+  if not NativeConstants then
+    for I:=0 to DataSize-1 do if DataOwners[I]=U then begin B^[FilePos]:=Data[I]; Inc(FilePos) end;
+  FilePos:=RelStart+Align16(FixLen); PayloadCheck:=0;
+  for CodeStart:=80 to FilePos-1 do
+    PayloadCheck:=((PayloadCheck shl 1) or (PayloadCheck shr 15))+B^[CodeStart];
+  if not NativeConstants then H.Reserved[4]:=PayloadCheck;
+  Move(H,B^,SizeOf(H));
+  FSplit(Units[U].Path,D,N,Ext);
+  if OutputDir='' then Path:=D+Units[U].Name+'.TPU'
+  else Path:=JoinPath(OutputDir,Units[U].Name+'.TPU');
+  Assign(F,Path); {$I-} Rewrite(F,1); E:=IOResult; {$I+}
+  if E<>0 then begin Dispose(B); Fail(16,'Creation TPU impossible: '+Path) end;
+  FilePos:=RelStart+Align16(FixLen);
+  {$I-} BlockWrite(F,B^,FilePos,Count); E:=IOResult; Close(F);
+  if IOResult<>0 then E:=1;
+  if (E<>0) or (Count<>FilePos) then begin Erase(F); E:=IOResult; E:=1 end;
+  {$I+}
+  Dispose(B);
+  if E<>0 then Fail(16,'Ecriture TPU impossible: '+Path);
+  if not Quiet then begin
+    if NativeConstants then WriteLn('TPU9 constantes (sans code): ',Path)
+    else WriteLn('TPU9/TPC1: ',Path);
+  end;
+end;
+
+procedure WriteUnits;
+var U, V: Byte;
+begin
+  { Checksums connus avant l'ecriture pour les cycles d'implementation. }
+  for U:=1 to UnitCount do if Units[U].FromSource then
+    Units[U].Checksum:=InterfaceChecksum(U);
+  for U:=1 to UnitCount do for V:=1 to UnitCount do
+    if (Units[U].DependencyChecks[V]<>0) and
+      (Units[U].DependencyChecks[V]<>Units[V].Checksum) then
+      Fail(70,Units[U].Name+' / '+Units[V].Name);
+  for U:=1 to UnitCount do if Units[U].FromSource then WriteCompiledUnit(U);
+end;
+
+procedure LoadCompiledUnit(U: Byte; Path: TShortString); forward;
+procedure RequireUnit(Name: TShortString; var U: Byte);
+var Path: TShortString;
+begin
+  U:=FindBuildUnit(Name);
+  if U<>0 then begin
+    if (U=CurrentUnit) or ((Units[U].State=1) and not Units[U].InterfaceReady) then
+      Fail(68,Name);
+    Exit;
+  end;
+  if UnitCount=MaxUnits then Unsupported('plus de 64 unites');
+  Path:=''; if BuildMode then Path:=FindUnitPath(Name,'.PAS');
+  Inc(UnitCount); U:=UnitCount; FillChar(Units[U],SizeOf(TBuildUnit),0);
+  Units[U].Name:=Name; Units[U].State:=1;
+  if Path<>'' then CompileSourceUnit(U,Path)
+  else begin
+    Path:=FindUnitPath(Name,'.TPU');
+    if Path='' then Fail(15,'Fichier introuvable: '+Name+'.TPU');
+    LoadCompiledUnit(U,Path);
+  end;
+end;
+
+procedure LoadCompiledUnit(U: Byte; Path: TShortString);
+var B: PBinaryBuffer; H: TUnitHeader; F: file; P: PParserState;
+    Size, Count, CodeStart, DataStart, RelStart, X: Longint;
+    A, Stub, I, J, Bucket, Next, Steps, W, R, Map, Target: Word;
+    V, Typ, Width, Capacity, Kind: Byte;
+    IsLocal: Boolean; Name: TShortString;
+    RefOffsets, RefChecks: array[0..MaxUnits+1] of Word;
+    RefUnits: array[0..MaxUnits+1] of Byte;
+    RefCount: Integer; E: Integer; Value: Longint;
+  procedure Bounds(P, N: Longint);
+  begin
+    if (P<0) or (N<0) or (P>Size-N) then Fail(72,'Reference TPU hors fichier');
+  end;
+  procedure DictBounds(P, N: Longint);
+  begin
+    Bounds(P,N);
+    if (P<80) or (P+N>H.ProcMap) then Fail(72,'Reference hors dictionnaire TPU');
+  end;
+  function ReadWord(P: Longint): Word;
+  begin Bounds(P,2); ReadWord:=B^[P]+Word(B^[P+1])*256 end;
+  function ReadString(P: Longint): TShortString;
+  var K: Integer; S: TShortString;
+  begin
+    Bounds(P,1); Bounds(P+1,B^[P]); S:='';
+    for K:=1 to B^[P] do S:=S+Chr(B^[P+K]);
+    ReadString:=S;
+  end;
+  function SymbolStub(P: Word): Word;
+  begin
+    DictBounds(P,4); DictBounds(P,4+B^[P+3]);
+    if (B^[P+3]=0) or (B^[P+3]>63) then Fail(72,'Nom de symbole TPU invalide');
+    SymbolStub:=P+4+B^[P+3];
+  end;
+  function CheckForUnit(S: TShortString): Word;
+  var K, Addr, Limit: Word;
+  begin
+    CheckForUnit:=0;
+    for K:=0 to ReadWord(H.Interf) div 2 do begin
+      Addr:=ReadWord(H.Interf+2+K*2); Limit:=0;
+      while Addr<>0 do begin
+        Inc(Limit); if Limit>MaxSymbols then Fail(72,'Cycle dans le hash TPU');
+        W:=SymbolStub(Addr);
+        if (Upper(ReadString(Addr+3))=S) and (B^[Addr+2]=89) then begin
+          DictBounds(W,8);
+          CheckForUnit:=ReadWord(W+2); Exit;
+        end;
+        DictBounds(Addr,4); Addr:=ReadWord(Addr);
+      end;
+    end;
+  end;
+  procedure DecodeType(P: Word);
+  var T, S, Addr, StubAddr, Limit: Word; UnitName: TShortString;
+  begin
+    DictBounds(P,4); T:=ReadWord(P); S:=ReadWord(P+2);
+    Width:=0; Capacity:=0;
+    if S=SymbolStub(H.Name) then begin
+      DictBounds(T,6); Typ:=B^[T]; W:=ReadWord(T+2);
+      if (Typ<>ttString) and (W>4) then Unsupported('taille de type TPU');
+      Width:=W;
+      if Typ=ttString then begin
+        W:=ReadWord(T+2);
+        if (W<2) or (W>256) then Fail(72,'Type string TPU invalide');
+        Capacity:=W-1; Width:=0;
+      end;
+      if (Typ=ttInteger) and not (Width in [1,2]) and
+        not ((Kind=80) and (Width=4) and not IsLocal) then
+        Unsupported('type entier TPU > 16 bits');
+    end else begin
+      { Les pointeurs disque originaux referencent un symbole d'unite,
+        pas un segment hote. Types SYSTEM standards dans COMPILER.INC. }
+      Addr:=H.Name; Limit:=0; UnitName:='';
+      while Addr<>0 do begin
+        Inc(Limit); if Limit>MaxUnits+2 then Fail(72,'Cycle des stubs d''unites TPU');
+        StubAddr:=SymbolStub(Addr); DictBounds(StubAddr,8);
+        if S=StubAddr then begin UnitName:=Upper(ReadString(Addr+3)); Break end;
+        Addr:=ReadWord(StubAddr+4);
+      end;
+      if UnitName='' then Fail(72,'Segment du type TPU invalide');
+      if UnitName<>'SYSTEM' then Unsupported('type d''une autre unite TPU');
+      case T of
+        $A0:begin Typ:=ttString; Capacity:=255 end;
+        $DE:begin Typ:=ttInteger; Width:=1 end;
+        $F0:begin Typ:=ttInteger; Width:=2 end;
+        $114:begin Typ:=ttInteger; Width:=4 end;
+        $130:begin Typ:=ttBoolean; Width:=1 end;
+        $14C:begin Typ:=ttChar; Width:=1 end;
+      else Unsupported('type SYSTEM non pris en charge dans la TPU');
+      end;
+    end;
+    if not (Typ in [ttString,ttInteger,ttBoolean,ttChar]) then Unsupported('type TPU non pris en charge');
+    if (Typ in [ttChar,ttBoolean]) and (Width<>1) then Fail(72,'Taille ordinale TPU invalide');
+  end;
+begin
+  ReadTPUHeader(Path,H);
+  SaveParser(P); CurrentUnit:=U; SourceName:=Path;
+  TokenLine:=1; TokenColumn:=1; InInterface:=True; Imports:=[]; ImportCount:=0;
+  Units[U].Path:=Path;
+  Assign(F,Path); {$I-} Reset(F,1); E:=IOResult; {$I+}
+  if E<>0 then Fail(15,Path);
+  Size:=FileSize(F);
+  if (Size<80) or (Size>SizeOf(TBinaryBuffer)) then begin Close(F); Fail(72,'Taille TPU invalide') end;
+  New(B);
+  {$I-} BlockRead(F,B^,Size,Count); E:=IOResult; Close(F);
+  if IOResult<>0 then E:=1; {$I+}
+  if (E<>0) or (Count<>Size) then Fail(72,'Lecture TPU incomplete');
+  if (H.Interf>=H.ProcMap) or (H.ProcMap>H.CodeMap) or
+    (H.CodeMap>H.ConstMap) or (H.ConstMap>H.DataMap) or
+    (H.DataMap>H.EndMaps) or (H.EndMaps>H.Units) or
+    (H.Units>H.Sources) or (H.Sources>H.EndTrace) then
+    Fail(72,'Ordre des sections TPU invalide');
+  A:=SymbolStub(H.Name); DictBounds(A,8);
+  if B^[H.Name+2]<>89 then Fail(72,'Symbole de nom TPU invalide');
+  Name:=Upper(ReadString(H.Name+3));
+  if Name<>Units[U].Name then Fail(69,Name+' <> '+Units[U].Name);
+  Units[U].Checksum:=ReadWord(A+2);
+  IsLocal:=(H.Flags=$8000) and (H.Reserved[0]=$5054) and (H.Reserved[1]=$3143);
+  if IsLocal and (H.Reserved[2]<>1) then Fail(72,'Version du profil TPC1 inconnue');
+  if IsLocal then begin
+    W:=0;
+    for X:=80 to Size-1 do W:=((W shl 1) or (W shr 15))+B^[X];
+    if W<>H.Reserved[4] then Fail(72,'Integrite de la TPU TPC1 invalide');
+  end;
+  if not IsLocal and ((H.CodeSize<>0) or (H.ConstSize<>0) or
+    (H.DataSize<>0) or (H.CodeFixupSize<>0) or (H.DataFixupSize<>0)) then
+    Unsupported('ABI Borland segmentee: seule TPU9 de constantes sans code est importable');
+  CodeStart:=Align16(H.EndTrace); DataStart:=CodeStart+Align16(H.CodeSize);
+  RelStart:=DataStart+Align16(H.ConstSize);
+  Units[U].CodeBase:=CodeSize; Units[U].DataBase:=DataSize;
+  if IsLocal then begin
+    if (H.ConstMap-H.CodeMap<>8) or (H.DataMap-H.ConstMap<>8) or
+      (H.EndMaps<>H.DataMap) or (H.DataSize<>0) or (H.DataFixupSize<>0) or
+      ((H.CodeMap-H.ProcMap) mod 8<>0) or (H.CodeMap-H.ProcMap<8) or
+      (H.CodeFixupSize mod 8<>0) then Fail(72,'Cartes du profil TPC1 invalides');
+    if (ReadWord(H.CodeMap+2)<>H.CodeSize) or
+      (ReadWord(H.CodeMap+4)<>H.CodeFixupSize) or
+      (ReadWord(H.ConstMap+2)<>H.ConstSize) then Fail(72,'Tailles cartes incoherentes');
+    if H.CodeSize<>0 then for I:=0 to H.CodeSize-1 do Emit(B^[CodeStart+I]);
+    A:=AllocData(H.ConstSize);
+    if H.ConstSize<>0 then Move(B^[DataStart],Data[A],H.ConstSize);
+    W:=ReadWord(H.ProcMap+6);
+    if W<>$FFFF then begin
+      if W>=H.CodeSize then Fail(72,'Initialisation TPU hors code');
+      Units[U].HasInit:=True; Units[U].InitAddress:=Units[U].CodeBase+W;
+    end;
+  end;
+  DictBounds(H.Interf,2); W:=ReadWord(H.Interf);
+  if (W>510) or Odd(W) then Fail(72,'Hash TPU invalide');
+  DictBounds(H.Interf,Word(W)+4);
+  for Bucket:=0 to W div 2 do begin
+    A:=ReadWord(H.Interf+2+Bucket*2); Steps:=0;
+    while A<>0 do begin
+      Inc(Steps); if Steps>MaxSymbols then Fail(72,'Cycle de symboles TPU');
+      Stub:=SymbolStub(A); Next:=ReadWord(A); Kind:=B^[A+2];
+      Name:=Upper(ReadString(A+3));
+      if Kind in [80,82,83] then begin
+        I:=NewSymbol(Name);
+        if Kind=83 then begin
+          if not IsLocal then Unsupported('procedure TPU Borland');
+          DictBounds(Stub,22);
+          Map:=ReadWord(Stub+2);
+          if (Map mod 8<>0) or (Map>=H.CodeMap-H.ProcMap) then Fail(72,'ProcMap TPU invalide');
+          Target:=ReadWord(H.ProcMap+Map+6);
+          if Target>=H.CodeSize then Fail(72,'Procedure TPU hors code');
+          Symbols[I].Kind:=skProc; Symbols[I].HasBody:=True;
+          Symbols[I].Addr:=Units[U].CodeBase+Target;
+        end else begin
+          if Kind=80 then begin
+            Symbols[I].Kind:=skConst; DecodeType(Stub);
+            if Typ=ttString then begin
+              DictBounds(Stub+4,1); DictBounds(Stub+4,1+B^[Stub+4]);
+              Symbols[I].StrValue:=ReadString(Stub+4);
+              Symbols[I].Addr:=StoreString(Symbols[I].StrValue);
+            end else begin
+              DictBounds(Stub+4,4); Value:=ReadWord(Stub+4);
+              if Width=4 then begin
+                Move(B^[Stub+4],Value,4);
+                if (Value<-32768) or (Value>32767) then Unsupported('constante TPU Longint hors Integer');
+                Width:=2;
+              end else if (Typ=ttInteger) and (Width=2) and (Value>32767) then Dec(Value,65536);
+              if (Typ=ttBoolean) and (Value>1) then Fail(72,'Constante Boolean TPU invalide');
+              if (Typ=ttChar) and (Value>255) then Fail(72,'Constante Char TPU invalide');
+              Symbols[I].Value:=Value;
+            end;
+          end else begin
+            if not IsLocal then Unsupported('variable TPU Borland');
+            DictBounds(Stub,9); Symbols[I].Kind:=skVar;
+            DecodeType(Stub+5); Target:=ReadWord(Stub+1);
+            if Typ=ttString then J:=Word(Capacity)+1 else J:=Width;
+            if Longint(Target)+J>H.ConstSize then Fail(72,'Variable TPU hors donnees');
+            Symbols[I].Addr:=Units[U].DataBase+Target;
+          end;
+          Symbols[I].Typ:=Typ; Symbols[I].Width:=Width; Symbols[I].Capacity:=Capacity;
+        end;
+      end else if not (Kind in [89]) then Unsupported('categorie de symbole TPU');
+      A:=Next;
+    end;
+  end;
+  Units[U].InterfaceReady:=True;
+  if IsLocal and (InterfaceChecksum(U)<>Units[U].Checksum) then begin
+    { L'ordre des buckets differe de l'ordre des declarations: le checksum
+      est verifie par la representation canonique triee ci-dessous. }
+    Fail(72,'Checksum d''interface TPU invalide');
+  end;
+  RefCount:=0; X:=H.Units;
+  while X<H.Sources do begin
+    if RefCount>MaxUnits+1 then Fail(72,'Trop de references TPU');
+    Bounds(X,3); Name:=Upper(ReadString(X+2));
+    if (Length(Name)=0) or (Length(Name)>63) or (X+3+Length(Name)>H.Sources) then
+      Fail(72,'Liste de dependances TPU invalide');
+    RefOffsets[RefCount]:=X-H.Units;
+    RefChecks[RefCount]:=CheckForUnit(Name);
+    if Name=Units[U].Name then RefUnits[RefCount]:=U
+    else if Name='SYSTEM' then RefUnits[RefCount]:=0
+    else begin
+      RequireUnit(Name,V); RefUnits[RefCount]:=V;
+      Units[U].Dependencies:=Units[U].Dependencies+[V];
+      Units[U].DependencyChecks[V]:=RefChecks[RefCount];
+      if not Units[V].FromSource and (RefChecks[RefCount]<>0) and
+        (RefChecks[RefCount]<>Units[V].Checksum) then Fail(70,Name);
+    end;
+    Inc(RefCount); Inc(X,3+Length(Name));
+  end;
+  if IsLocal then begin
+    for I:=1 to H.CodeFixupSize div 8 do begin
+      X:=RelStart+(Longint(I)-1)*8; Bounds(X,8);
+      R:=ReadWord(X); Map:=ReadWord(X+2); Target:=ReadWord(X+4); A:=ReadWord(X+6);
+      if Longint(A)+2>H.CodeSize then Fail(72,'Fixup TPU hors code');
+      J:=0;
+      while (J<RefCount) and (RefOffsets[J]<>(R and $0FFF)) do Inc(J);
+      if J=RefCount then Fail(72,'Reference d''unite TPU invalide');
+      V:=RefUnits[J]; A:=A+Units[U].CodeBase;
+      if R and $F000=$8000 then begin
+        if (V=0) or (Map<>0) then Fail(72,'Fixup de donnees TPU invalide');
+        Target:=GlobalOffset(Target,V,False);
+        if (Target>=DataSize) or (DataOwners[Target]<>V) then Fail(72,'Cible de donnees TPU invalide');
+        if FixupCount=MaxFixups then Unsupported('trop de fixups TPU');
+        Inc(FixupCount); Fixups[FixupCount].Position:=A;
+        Fixups[FixupCount].DataOffset:=Target; PatchWord(A,0);
+      end else if R and $F000=$4000 then begin
+        if (V=0) and (Map=$FFFF) then Target:=RuntimeAddress(Target)
+        else begin
+          if (V=0) or (Map<>0) then Fail(72,'Fixup de code TPU invalide');
+          Target:=GlobalOffset(Target,V,True);
+          if Target>CodeSize then Fail(72,'Cible de code TPU invalide');
+        end;
+        PatchJump(A,Target);
+      end else Fail(72,'Nature de fixup TPU inconnue');
+    end;
+  end;
+  Units[U].State:=2;
+  if Units[U].HasInit then begin Inc(InitCount); InitOrder[InitCount]:=U end;
+  if not Quiet then WriteLn('Loaded unit ',Units[U].Name,': ',Path);
+  Dispose(B); RestoreParser(P);
+end;
+
 procedure UsesClause;
-var Name, Path: TShortString; H: TUnitHeader; U: Byte;
+var Name: TShortString; U: Byte;
 begin
   if Token<>tkUses then Exit;
   NextToken;
@@ -1200,26 +1846,7 @@ begin
     if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
     Name:=TokenText; NextToken;
     if Name<>'SYSTEM' then begin
-      U:=FindBuildUnit(Name);
-      if U<>0 then begin
-        if (U=CurrentUnit) or ((Units[U].State=1) and not Units[U].InterfaceReady) then
-          Fail(68,Name);
-      end else begin
-        Path:='';
-        if BuildMode then Path:=FindUnitPath(Name,'.PAS');
-        if Path<>'' then begin
-          if UnitCount=MaxUnits then Unsupported('plus de 64 unites');
-          Inc(UnitCount); U:=UnitCount;
-          FillChar(Units[U],SizeOf(TBuildUnit),0);
-          Units[U].Name:=Name; Units[U].State:=1;
-          CompileSourceUnit(U,Path);
-        end else begin
-          Path:=FindUnitPath(Name,'.TPU');
-          if Path='' then Fail(15,'Fichier introuvable: '+Name+'.TPU');
-          ReadTPUHeader(Path,H);
-          Unsupported('liaison TPU9 de '+Name+' (source absent, en-tete valide)');
-        end;
-      end;
+      RequireUnit(Name,U);
       AddImport(U);
     end;
     if Token<>tkComma then Break;
@@ -1270,13 +1897,20 @@ procedure CompileProgram;
 var I: Byte;
 begin
   CodeSize:=0; DataSize:=0; SymbolCount:=0; FixupCount:=0;
+  RelativeCount:=0; UnitOutput:=False;
   UnitCount:=0; InitCount:=0; CurrentUnit:=0; Imports:=[]; ImportCount:=0;
   InInterface:=False;
   Emit($0E); Emit($1F); Emit($0E); Emit($07); Emit($FC); { DS=ES=CS; cld }
   EntryFixup:=Jump;
   EmitRuntime;
   NextToken;
-  if Token=tkUnit then Unsupported('production d''une TPU9');
+  if Token=tkUnit then begin
+    NextToken;
+    if Token<>tkIdent then Fail(2,'Nom d''unite attendu');
+    UnitCount:=1; FillChar(Units[1],SizeOf(TBuildUnit),0);
+    Units[1].Name:=TokenText; Units[1].State:=1;
+    CompileSourceUnit(1,MainSourceName); UnitOutput:=True; Exit;
+  end;
   if Token=tkProgram then begin
     NextToken; Need(tkIdent);
     if Token=tkLP then begin
@@ -1356,7 +1990,9 @@ begin
   WriteLn('TPU9: en-tete=',SizeOf(H),' octets; fin dictionnaire=',H.EndTrace);
   WriteLn('Code=',H.CodeSize,' constantes=',H.ConstSize,' donnees=',H.DataSize);
   WriteLn('Fixups code=',H.CodeFixupSize,' constantes=',H.DataFixupSize);
-  WriteLn('Inspection seulement: symboles et liaison non implementes.');
+  if (H.Flags=$8000) and (H.Reserved[0]=$5054) and (H.Reserved[1]=$3143) then
+    WriteLn('Profil TPC1: ABI locale near/CS=DS, non compatible Borland.')
+  else WriteLn('TPU9 Borland: import limite aux unites de constantes sans code.');
 end;
 
 procedure Help;
@@ -1364,7 +2000,8 @@ begin
   WriteLn('TPC - portage PARTIEL de Turbo Pascal 6, cible DOS 8086');
   WriteLn('TPC fichier.pas [/Erepertoire] [/Urepertoires] [/Dsymboles] [/$X-]');
   WriteLn('/B reconstruit les unites depuis leurs sources (sous-ensemble Pascal).');
-  WriteLn('Pas de production TPU; liaison des TPU existantes non implementee.');
+  WriteLn('Production/liaison TPU9 profil TPC1; ABI locale, pas ABI Borland.');
+  WriteLn('Import TPU9 Borland limite aux unites de constantes sans code.');
   WriteLn('/M reconnu, refuse: reconstruction incrementale non implementee.');
   WriteLn('/Q silencieux; /T repertoire Turbo (cherche les TPU).');
   WriteLn('/I, /O, /L, /V, /F, /G reconnus mais refuses: fonctions manquantes.');
@@ -1447,5 +2084,6 @@ begin
   Move(Defines,InitialDefines,SizeOf(Defines)); InitialDefineCount:=DefineCount;
   InitialOptions:=OptionBits;
   if not Quiet then WriteLn('TPC: portage partiel TP6; hote Pascal, cible DOS 8086');
-  LoadSource; CompileProgram; WriteExecutable;
+  LoadSource; CompileProgram; WriteUnits;
+  if not UnitOutput then WriteExecutable;
 end.
