@@ -23,6 +23,8 @@ Program TPC;
   TURBO.TPL: index TPU9 concatene, lecture directe par tranche, import des
   constantes et routines Borland. Ponts far, donnees DS separees, fixups MZ;
   initialisation/finalisation SYSTEM et initialisations des unites liees.
+  Profil local v4: persistance des ponts/references natifs; types ordinaux et
+  parametres shortstring natifs. ABI structuree/8087/overlays non complete.
   La compatibilite avec le linker Borland n'a pas ete validee.
   Les fonctionnalites manquantes ont un diagnostic propre sans faux numero TP.
   Numeros verifies dans le source et dans la table du TPC.EXE original DISK1.
@@ -238,6 +240,7 @@ Type
   FromSource: Boolean;
   Path: TShortString;
   Dependencies: TUnitSet;
+  NativeDependencies: TUnitSet;
   DependencyChecks: Array[1..MaxUnits] Of Word;
   Checksum: Word;
   CodeBase, DataBase: Word;
@@ -287,6 +290,8 @@ Var
  Scopes: Array[0..MaxScopes] Of TScopeInfo;
  Dictionary: Array[0..63] Of Word;
  TypeCount, ScopeCount, CurrentScope, ExprType: Word;
+ NativeTypeOwners: Array[1..MaxTypes] Of Byte;
+ NativeTypeOffsets: Array[1..MaxTypes] Of Word;
  ExprUnsigned: Boolean;
  ExprKnown: Boolean;
  ExprValue: Longint;
@@ -415,6 +420,7 @@ Function ErrorMessage(N: Word): TShortString;Begin
   94:ErrorMessage:='"." expected';
   95:ErrorMessage:='".." expected';
   97:ErrorMessage:='Invalid FOR control variable';
+  101:ErrorMessage:='String length mismatch';
  106:ErrorMessage:='Character expression expected';
  120:ErrorMessage:='NIL expected';
  123:ErrorMessage:='Too many symbols';
@@ -988,6 +994,8 @@ End;
 Procedure InitTypes;
 Begin
  TypeCount:=0;
+ FillChar(NativeTypeOwners,SizeOf(NativeTypeOwners),0);
+ FillChar(NativeTypeOffsets,SizeOf(NativeTypeOffsets),0);
  TypeCount:=NewType(ttInteger,2,0,True,-32768,32767,0);
  TypeCount:=NewType(ttInteger,1,0,False,0,255,1);
  TypeCount:=NewType(ttInteger,2,0,False,0,65535,1);
@@ -1094,7 +1102,8 @@ Procedure NativeReference(U, Kind: Byte; Map, Target: Word);Begin
 End;
 
 Procedure NeedNative(U: Byte);Begin
- If CurrentUnit<>0 Then Unsupported('pont ABI Borland dans une TPU de code locale');
+ If CurrentUnit<>0 Then
+  Units[CurrentUnit].NativeDependencies:=Units[CurrentUnit].NativeDependencies+[U];
  NativeNeeded:=True; ActivateNative(U);
 End;
 
@@ -1471,7 +1480,7 @@ End;
 
 Function NativeCall(I: Word): Byte;
 Var
- J, V: Word;
+ J, V, A, ParamType: Word;
  T: Byte;
  Name: TShortString;
 Begin
@@ -1481,6 +1490,7 @@ Begin
   Need(tkLP);
   For J:=1 To Symbols[I].ParamCount Do Begin
    If J<>1 Then Need(tkComma);
+  ParamType:=Symbols[I].ParamTypeIds[J];
    If Symbols[I].ParamFlags[J]=6 Then Begin
     If Token<>tkIdent Then Fail(20,'Parametre var attendu');
     Name:=TokenText; NextToken; V:=ResolveSymbol(Name);
@@ -1488,15 +1498,27 @@ Begin
     (Symbols[V].Width<>Symbols[I].ParamWidths[J]) Or
     (Symbols[V].SignedByte<>Symbols[I].ParamSigned[J]) Then Fail(26,
     'Type du parametre var');
+    If (Symbols[I].ParamTypes[J]=ttString) And
+       ((Symbols[V].Capacity<>Types[ParamType].Capacity) And (OptionBits And $10<>0)) Then
+      Fail(101,'Longueur de chaine du parametre var');
     PushVariableAddress(V);
    End Else
    Begin
     T:=Expression;
+    If Symbols[I].ParamTypes[J]=ttString Then Begin
+     If Not (T In [ttString,ttChar]) Then Fail(26,'Chaine pour parametre natif attendue');
+     If T=ttChar Then Begin
+      A:=AllocData(2); Emit($A2); DataAddress(A+1);
+      Emit2($C6,$06); DataAddress(A); Emit(1); Emit($B8); DataAddress(A);
+     End;
+     Emit($1E); Emit($50); { segment et adresse du shortstring source }
+    End Else Begin
     If T<>Symbols[I].ParamTypes[J] Then Fail(26,'Type du parametre valeur');
     If Symbols[I].ParamWidths[J]=1 Then Begin
      If Symbols[I].ParamSigned[J] Then Emit($98) Else Emit2($30,$E4);
     End;
     Emit($50); { TP6 empile les scalaires courts dans un mot }
+    End;
    End;
   End;
   Need(tkRP);
@@ -2742,7 +2764,7 @@ Begin
  FillChar(SymbolEntries,SizeOf(SymbolEntries),0);
  FillChar(Stubs,SizeOf(Stubs),0);
  H.Signature[0]:='T'; H.Signature[1]:='P'; H.Signature[2]:='U'; H.Signature[3]:='9';
- H.Flags:=$8000; H.Reserved[0]:=$5054; H.Reserved[1]:=$3143; H.Reserved[2]:=3;
+ H.Flags:=$8000; H.Reserved[0]:=$5054; H.Reserved[1]:=$3143; H.Reserved[2]:=4;
  Units[U].Checksum:=InterfaceChecksum(U);
  Posn:=80; H.Interf:=Posn; PutWord(126);
  For I:=1 To 64 Do PutWord(0);
@@ -2837,6 +2859,29 @@ If Not NativeConstants Then Begin
   For J:=1 To Symbols[I].ParamCount Do Begin
    PutWord(Symbols[I].ParamTypeIds[J]); PutWord(Symbols[I].ParamFlags[J]);
   End;
+ End;
+ H.Reserved[6]:=Posn;
+ MetadataCount:=0;
+ For V:=1 To UnitCount Do If V In Units[U].NativeDependencies Then Inc(MetadataCount);
+ PutWord(MetadataCount);
+ For V:=1 To UnitCount Do If V In Units[U].NativeDependencies Then Begin
+  PutString(Units[V].Name); PutWord(Units[V].Checksum);
+ End;
+ MetadataCount:=0;
+ For I:=1 To NativeRefCount Do If CodeOwners[NativeRefs[I].Position]=U Then Inc(MetadataCount);
+ PutWord(MetadataCount);
+ For I:=1 To NativeRefCount Do If CodeOwners[NativeRefs[I].Position]=U Then Begin
+  PutWord(LocalOffset(NativeRefs[I].Position,U,True));
+  PutString(Units[NativeRefs[I].U].Name); PutWord(Units[NativeRefs[I].U].Checksum);
+  PutWord(NativeRefs[I].Kind); PutWord(NativeRefs[I].Map); PutWord(NativeRefs[I].Target);
+ End;
+ MetadataCount:=0;
+ For I:=1 To RelocationCount Do If (Relocations[I].Segm=0) And
+   (CodeOwners[Relocations[I].Offs]=U) Then Inc(MetadataCount);
+ PutWord(MetadataCount);
+ For I:=1 To RelocationCount Do If (Relocations[I].Segm=0) And
+   (CodeOwners[Relocations[I].Offs]=U) Then Begin
+  PutWord(LocalOffset(Relocations[I].Offs,U,True)); PutWord(RelocationKinds[I]);
  End;
 End;
 If Odd(Posn) Then PutByte(0);
@@ -2970,6 +3015,7 @@ Begin
  For U:=1 To UnitCount Do If Units[U].FromSource Then WriteCompiledUnit(U);
 End;
 Procedure LoadCompiledUnit(U: Byte; Path: TShortString);Forward;
+Function DecodeNativeType(U: Byte; Offset: Word): Word; Forward;
 
 Procedure RequireUnit(Name: TShortString; Var U: Byte);
 Var
@@ -3019,6 +3065,7 @@ Var
  RefCount: Integer;
  E: Integer;
  Value: Longint;
+ DecodedTypeId: Word;
 
 Procedure Bounds(P, N: Longint);Begin
  If (P<0) Or (N<0) Or (P>Size-N) Then Fail(72,'Reference TPU hors fichier');
@@ -3078,8 +3125,39 @@ Procedure Reject(S: TShortString);Begin
 End;
 Begin
  TypeSupported:=True; TypeSigned:=False;
+ DecodedTypeId:=0;
  DictBounds(P,4); T:=ReadWord(P); S:=ReadWord(P+2);
  Width:=0; Capacity:=0;
+ If ProjectForeign Then Begin
+  Addr:=H.Name; Limit:=0; UnitName:='';
+  While Addr<>0 Do Begin
+   Inc(Limit); If Limit>MaxUnits+2 Then Fail(72,'Cycle des stubs de types Borland');
+   StubAddr:=SymbolStub(Addr); DictBounds(StubAddr,8);
+   If S=StubAddr Then Begin UnitName:=Upper(ReadString(Addr+3)); Break End;
+   Addr:=ReadWord(StubAddr+4);
+  End;
+  If UnitName='' Then Fail(72,'Proprietaire de type Borland invalide');
+  If (UnitName='SYSTEM') And (FindBuildUnit('SYSTEM')=0) And
+     (FindLibraryUnit('SYSTEM')=0) And (FindUnitPath('SYSTEM','.TPU')='') Then Begin
+   { Import de constantes sans runtime: offsets standard verifies dans
+     COMPILER.INC. Aucun code n'est lie par ce chemin de secours. }
+   Case T Of
+    $A0:DecodedTypeId:=7; $DE:DecodedTypeId:=2; $F0:DecodedTypeId:=1;
+    $102:DecodedTypeId:=3; $130:DecodedTypeId:=5; $14C:DecodedTypeId:=6;
+    $114:DecodedTypeId:=NewType(ttInteger,4,0,True,-2147483647-1,2147483647,1);
+   Else Begin Reject('type SYSTEM sans descripteur disponible'); Exit End;
+   End;
+   Typ:=Types[DecodedTypeId].Typ; Width:=Types[DecodedTypeId].Width;
+   Capacity:=Types[DecodedTypeId].Capacity; TypeSigned:=Types[DecodedTypeId].Signed;
+   Exit;
+  End;
+  If UnitName=Units[U].Name Then V:=U Else RequireUnit(UnitName,V);
+  DecodedTypeId:=DecodeNativeType(V,T);
+  If DecodedTypeId=0 Then Begin Reject('descripteur de type Borland non pris en charge'); Exit End;
+  Typ:=Types[DecodedTypeId].Typ; Width:=Types[DecodedTypeId].Width;
+  Capacity:=Types[DecodedTypeId].Capacity; TypeSigned:=Types[DecodedTypeId].Signed;
+  Exit;
+ End;
  If S=SymbolStub(H.Name) Then Begin
   DictBounds(T,6); Typ:=B^[T]; W:=ReadWord(T+2);
   TypeSigned:=(Typ=ttInteger) And (B^[T+1] And 1<>0);
@@ -3187,7 +3265,7 @@ Begin
  Units[U].Checksum:=ReadWord(A+2);
  IsLocal:=(H.Flags=$8000) And (H.Reserved[0]=$5054) And (H.Reserved[1]=$3143);
  ProjectForeign:=Not IsLocal;
-  If IsLocal And Not (H.Reserved[2] In [1,2,3]) Then Fail(72,'Version du profil TPC1 inconnue');
+  If IsLocal And Not (H.Reserved[2] In [1,2,3,4]) Then Fail(72,'Version du profil TPC1 inconnue');
  If IsLocal Then Begin
   W:=0;
   For X:=80 To Size-1 Do W:=((W Shl 1) Or (W Shr 15))+B^[X];
@@ -3199,6 +3277,7 @@ Begin
   ((H.EndMaps-H.DataMap) Mod 8<>0) Then Fail(72,'Cartes natives TPU invalides');
   MapSum:=0; FixSum:=0; X:=H.CodeMap;
   While X<H.ConstMap Do Begin
+    If ReadWord(X+4) Mod 8<>0 Then Fail(72,'Fixups code Borland non alignes');
    If Longint(MapSum)+ReadWord(X+2)>65535 Then Fail(72,'Code natif trop grand');
    Inc(MapSum,ReadWord(X+2)); Inc(FixSum,ReadWord(X+4)); Inc(X,8);
   End;
@@ -3206,6 +3285,7 @@ Begin
   'Tailles code natif incoherentes');
   MapSum:=0; FixSum:=0; X:=H.ConstMap;
   While X<H.DataMap Do Begin
+    If ReadWord(X+4) Mod 8<>0 Then Fail(72,'Fixups constantes Borland non alignes');
    Inc(MapSum,ReadWord(X+2)); Inc(FixSum,ReadWord(X+4)); Inc(X,8);
   End;
   If (MapSum<>H.ConstSize) Or (FixSum<>H.DataFixupSize) Then Fail(72,
@@ -3255,9 +3335,7 @@ Begin
           Else Begin
             Symbols[I].Typ:=Typ; Symbols[I].Width:=Width; Symbols[I].Capacity:=Capacity;
             If ProjectForeign Then Begin
-              TIndex:=BuiltinType(Name);
-              If TIndex<>0 Then ApplyType(I,TIndex)
-              Else Symbols[I].TypeId:=NewType(Typ,Width,Capacity,TypeSigned,-32768,32767,1);
+              ApplyType(I,DecodedTypeId);
             End;
           End;
         End Else If ProjectForeign And (Kind=83) Then Begin
@@ -3271,19 +3349,22 @@ Begin
       DictBounds(Stub,22+5*ParamN);
       If (ReadWord(Stub+16)=0) And (ReadWord(Stub+18)=0) Then Begin
        TypeSupported:=True; TypeSigned:=False; Typ:=ttVoid; Width:=0;
+      DecodedTypeId:=0;
       End Else DecodeType(Stub+16);
       If TypeSupported And (Typ<>ttString) And (Width<=2) Then Begin
        Symbols[I].Typ:=Typ; Symbols[I].Width:=Width;
        Symbols[I].SignedByte:=TypeSigned And (Width=1);
+      Symbols[I].TypeId:=DecodedTypeId;
        Symbols[I].Kind:=skProc; Symbols[I].Native:=True;
        Symbols[I].NativeMap:=Map; Symbols[I].ParamCount:=ParamN;
        For K:=1 To ParamN Do Begin
         DecodeType(Stub+22+(K-1)*5);
-        If Not TypeSupported Or (Typ=ttString) Or (Width>2) Or
+        If Not TypeSupported Or (Width>2) Or
         Not (B^[Stub+26+(K-1)*5] In [2,6]) Then Symbols[I].Kind:=skForeign;
         Symbols[I].ParamTypes[K]:=Typ; Symbols[I].ParamWidths[K]:=Width;
         Symbols[I].ParamFlags[K]:=B^[Stub+26+(K-1)*5];
         Symbols[I].ParamSigned[K]:=TypeSigned And (Width=1);
+        Symbols[I].ParamTypeIds[K]:=DecodedTypeId;
        End;
       End;
      End;
@@ -3301,6 +3382,7 @@ Begin
       Symbols[I].Kind:=skVar; Symbols[I].Native:=True;
       Symbols[I].Typ:=Typ; Symbols[I].Width:=Width;
       Symbols[I].SignedByte:=TypeSigned And (Width=1);
+      Symbols[I].TypeId:=DecodedTypeId;
       Symbols[I].NativeMap:=Map; Symbols[I].NativeConst:=B^[Stub]=1;
       Symbols[I].Addr:=Target;
      End;
@@ -3318,6 +3400,7 @@ Begin
     Begin
      If Kind=80 Then Begin
       Symbols[I].Kind:=skConst; DecodeType(Stub);
+      Symbols[I].TypeId:=DecodedTypeId;
       If Not TypeSupported Then Symbols[I].Kind:=skForeign Else
       If Typ=ttString Then Begin
        DictBounds(Stub+4,1); DictBounds(Stub+4,1+B^[Stub+4]);
@@ -3336,6 +3419,7 @@ Begin
                            Else Unsupported('constante TPU Longint hors Integer');
         End;
         Width:=2;
+        If Symbols[I].Kind<>skForeign Then Symbols[I].TypeId:=1;
        End Else If (Typ=ttInteger) And (Width=2) And (Value>32767) Then Dec(Value,65536);
        If (Typ=ttBoolean) And (Value>1) Then Fail(72,'Constante Boolean TPU invalide');
        If (Typ=ttChar) And (Value>255) Then Fail(72,'Constante Char TPU invalide');
@@ -3374,8 +3458,9 @@ Begin
         (DiskTypes[K].LowBound>DiskTypes[K].HighBound) Then Fail(72,'Descripteur de type TPU invalide');
       If DiskTypes[K].Typ=ttString Then Begin
         If (DiskTypes[K].Width<>0) Or (DiskTypes[K].Capacity=0) Then Fail(72,'Taille string de metadonnees TPU');
-      End Else If Not (DiskTypes[K].Width In [1,2]) Or
-        (DiskTypes[K].LowBound<-32768) Or (DiskTypes[K].HighBound>65535) Then
+      End Else If Not (DiskTypes[K].Width In [1,2,4]) Or
+        ((DiskTypes[K].Width=4) And (DiskTypes[K].Typ<>ttInteger)) Or
+        ((DiskTypes[K].Width<>4) And ((DiskTypes[K].LowBound<-32768) Or (DiskTypes[K].HighBound>65535))) Then
           Fail(72,'Taille ou bornes ordinales de metadonnees TPU');
       If K<=7 Then
         If (DiskTypes[K].Typ<>Types[K].Typ) Or (DiskTypes[K].Width<>Types[K].Width) Or
@@ -3417,7 +3502,7 @@ Begin
       If I=0 Then Fail(72,'Metadonnees de symbole TPU inconnues');
       ApplyType(I,TypeMap[TIndex]);
     End;
-    If H.Reserved[2]=3 Then Begin
+    If H.Reserved[2]>=3 Then Begin
      DictBounds(MetaPos,2); MetaCount:=ReadWord(MetaPos); Inc(MetaPos,2);
      If MetaCount>MaxSymbols Then Fail(72,'Trop de signatures TPU');
      For K:=1 To MetaCount Do Begin
@@ -3444,7 +3529,7 @@ Begin
     End;
   End;
   Units[U].InterfaceReady:=True;
-  If IsLocal And (InterfaceChecksumMode(U,H.Reserved[2]>=2,H.Reserved[2]=3)<>Units[U].Checksum) Then Begin
+  If IsLocal And (InterfaceChecksumMode(U,H.Reserved[2]>=2,H.Reserved[2]>=3)<>Units[U].Checksum) Then Begin
     { L'ordre des buckets differe de l'ordre des declarations: le checksum
       est verifie par la representation canonique triee ci-dessous. }
   Fail(72,'Checksum d''interface TPU invalide');
@@ -3498,6 +3583,45 @@ Begin
    End Else Fail(72,'Nature de fixup TPU inconnue');
   End;
  End;
+ If IsLocal And (H.Reserved[2]>=4) Then Begin
+  X:=H.Reserved[6]; DictBounds(X,2); MetaCount:=ReadWord(X); Inc(X,2);
+  If MetaCount>MaxUnits Then Fail(72,'Trop de dependances natives TPU');
+  For K:=1 To MetaCount Do Begin
+   DictBounds(X,1); Name:=Upper(ReadString(X));
+   If (Length(Name)=0) Or (Length(Name)>63) Then Fail(72,'Nom de dependance native TPU invalide');
+   DictBounds(X,Length(Name)+3); Inc(X,Length(Name)+1); W:=ReadWord(X); Inc(X,2);
+   RequireUnit(Name,V);
+   If NativeBuffers[V]=Nil Then Fail(72,'Dependance native TPU non Borland');
+   If W<>Units[V].Checksum Then Fail(70,Name);
+   Units[U].NativeDependencies:=Units[U].NativeDependencies+[V];
+   NativeNeeded:=True; ActivateNative(V);
+  End;
+  DictBounds(X,2); MetaCount:=ReadWord(X); Inc(X,2);
+  If MetaCount>MaxNativeRefs-NativeRefCount Then Fail(72,'Trop de references natives TPU');
+  For K:=1 To MetaCount Do Begin
+   DictBounds(X,3); A:=ReadWord(X); Inc(X,2); Name:=Upper(ReadString(X));
+   If (Length(Name)=0) Or (Length(Name)>63) Then Fail(72,'Nom de cible native TPU invalide');
+   DictBounds(X,Length(Name)+9); Inc(X,Length(Name)+1);
+   W:=ReadWord(X); R:=ReadWord(X+2); Map:=ReadWord(X+4); Target:=ReadWord(X+6); Inc(X,8);
+   If (Longint(A)+2>H.CodeSize) Or Not (R In [1,2,3]) Then Fail(72,'Reference native TPU invalide');
+   RequireUnit(Name,V);
+   If (NativeBuffers[V]=Nil) Or Not (V In Units[U].NativeDependencies) Then
+    Fail(72,'Cible native TPU non declaree');
+   If W<>Units[V].Checksum Then Fail(70,Name);
+   Inc(NativeRefCount); NativeRefs[NativeRefCount].Position:=Units[U].CodeBase+A;
+   NativeRefs[NativeRefCount].U:=V; NativeRefs[NativeRefCount].Kind:=R;
+   NativeRefs[NativeRefCount].Map:=Map; NativeRefs[NativeRefCount].Target:=Target;
+   PatchWord(Units[U].CodeBase+A,0);
+  End;
+  DictBounds(X,2); MetaCount:=ReadWord(X); Inc(X,2);
+  If MetaCount>MaxNativeRefs-RelocationCount Then Fail(72,'Trop de relocalisations natives TPU');
+  DictBounds(X,Longint(MetaCount)*4);
+  For K:=1 To MetaCount Do Begin
+   A:=ReadWord(X); W:=ReadWord(X+2); Inc(X,4);
+   If (Longint(A)+2>H.CodeSize) Or (W>1) Then Fail(72,'Relocalisation native TPU invalide');
+   AddSegmentRelocation(Units[U].CodeBase+A,W); PatchWord(Units[U].CodeBase+A,0);
+  End;
+ End;
  Units[U].State:=2;
  If Units[U].HasInit Then Begin
   Inc(InitCount); InitOrder[InitCount]:=U
@@ -3524,6 +3648,59 @@ Function NativeWord(U: Byte; P: Longint): Word;Begin
  If (NativeBuffers[U]=Nil) Or (P<0) Or (P+2>UnitFileSize(NativeHeaders[U])) Then    Fail(
  72,'Reference native hors unite');
  NativeWord:=NativeBuffers[U]^[P]+Word(NativeBuffers[U]^[P+1])*256;
+End;
+
+Function DecodeNativeType(U: Byte; Offset: Word): Word;
+Var B: PBinaryBuffer; H: TUnitHeader; T,I,BaseId: Word; Typ,Width,Capacity,Modifier: Byte;
+  L,R: Longint; Signed: Boolean; S: TShortString;
+Begin
+ DecodeNativeType:=0;
+ If NativeBuffers[U]=Nil Then Unsupported('type provenant d''une unite non native');
+ H:=NativeHeaders[U]; B:=NativeBuffers[U];
+ If (Offset<80) Or (Longint(Offset)+6>H.ProcMap) Then Fail(72,'Descripteur Borland hors dictionnaire');
+ For I:=8 To TypeCount Do
+  If (NativeTypeOwners[I]=U) And (NativeTypeOffsets[I]=Offset) Then Begin DecodeNativeType:=I; Exit End;
+ Typ:=B^[Offset]; Modifier:=B^[Offset+1]; T:=NativeWord(U,Offset+2);
+ Signed:=(Modifier And 1)<>0; Capacity:=0;
+ If Typ=ttString Then Begin
+  If (T<2) Or (T>256) Then Fail(72,'Taille string Borland invalide');
+  If T=256 Then Begin DecodeNativeType:=7; Exit End;
+  Width:=0; Capacity:=T-1; L:=0; R:=Capacity; BaseId:=7;
+ End Else If Typ In [ttInteger,ttBoolean,ttChar,ttEnum] Then Begin
+  If Not (T In [1,2,4]) Then Fail(72,'Taille ordinale Borland invalide');
+  If (Typ<>ttInteger) And (T>2) Then Fail(72,'Taille ordinale Borland non entiere');
+  If Longint(Offset)+18>H.ProcMap Then Fail(72,'Bornes ordinales Borland tronquees');
+  Width:=T; Move(B^[Offset+6],L,4); Move(B^[Offset+10],R,4);
+  If L>R Then Fail(72,'Bornes ordinales Borland inversees');
+  If (T=1) And ((L<-128) Or (R>255)) Then Fail(72,'Bornes Borland hors octet');
+  If (T=2) And ((L<-32768) Or (R>65535)) Then Fail(72,'Bornes Borland hors mot');
+  Case Typ Of
+   ttBoolean:Begin
+    If (T<>1) Or (L<0) Or (R>1) Then Fail(72,'Descripteur Boolean Borland invalide');
+    If (L=0) And (R=1) Then Begin DecodeNativeType:=5; Exit End;
+    BaseId:=5;
+   End;
+   ttChar:Begin
+  If (T<>1) Or (L<0) Or (R>255) Then Fail(72,'Descripteur Char Borland invalide');
+  If (L=0) And (R=255) Then Begin DecodeNativeType:=6; Exit End;
+  BaseId:=6;
+   End;
+   ttInteger:Begin
+  BaseId:=1;
+  If (T=1) And (L=0) And (R=255) And Not Signed Then Begin DecodeNativeType:=2; Exit End;
+  If (T=1) And (L=-128) And (R=127) And Signed Then Begin DecodeNativeType:=4; Exit End;
+  If (T=2) And (L=-32768) And (R=32767) And Signed Then Begin DecodeNativeType:=1; Exit End;
+  If (T=2) And (L=0) And (R=65535) And Not Signed Then Begin DecodeNativeType:=3; Exit End;
+   End;
+   ttEnum:BaseId:=0;
+  End;
+ End Else Exit; { structure valide mais backend pas encore disponible }
+ I:=NewType(Typ,Width,Capacity,Signed,L,R,BaseId);
+ NativeTypeOwners[I]:=U; NativeTypeOffsets[I]:=Offset;
+ If Typ=ttEnum Then Begin
+  Types[I].IdentityUnit:=Units[U].Name; Str(Offset,S); Types[I].IdentityName:='$TPU'+S;
+ End;
+ DecodeNativeType:=I;
 End;
 
 Procedure ActivateNative(U: Byte);
@@ -3611,6 +3788,18 @@ Procedure NativeDataRelocation(P: Word; Kind: Byte);Begin
  Relocations[RelocationCount].Segm:=$FFFF; RelocationKinds[RelocationCount]:=Kind;
 End;
 
+Function NativeMapLength(U, Category: Byte; Map: Word): Word;
+Var P: Word;
+Begin
+ P:=NativeMapAddress(U,Category,Map);
+ Case Category Of
+  0:P:=NativeHeaders[U].CodeMap;
+  1:P:=NativeHeaders[U].DataMap;
+  2:P:=NativeHeaders[U].ConstMap;
+ End;
+ NativeMapLength:=NativeWord(U,Longint(P)+Map+2);
+End;
+
 Procedure LinkNative;
 Var
  U, Sys: Byte;
@@ -3682,16 +3871,22 @@ Begin
    V:=RefUnit(U,R And $FFF); SG:=0;
    If R And $8000<>0 Then Begin
     SG:=1;
-    If R And $4000<>0 Then W:=NativeMapAddress(V,2,TM)+T
-                      Else W:=NativeMapAddress(V,1,TM)+T;
-   End Else If R And $4000<>0 Then W:=NativeMapAddress(V,0,TM)+T
-                              Else W:=NativeProcAddress(V,TM)+T;
-   At:=At+Source;
-   If R And $1000<>0 Then Begin
-    WriteAt(At,W,InConst); Inc(At,2)
-   End
-   Else If R And $2000=0 Then Begin
-    WriteAt(At,Word(Longint(W)-At-2),InConst)
+    If R And $4000<>0 Then Begin
+     If (R And $1000<>0) And (T>=NativeMapLength(V,2,TM)) Then Fail(72,'Cible constante hors carte native');
+     W:=NativeMapAddress(V,2,TM)+T;
+    End Else Begin
+     If (R And $1000<>0) And (T>=NativeMapLength(V,1,TM)) Then Fail(72,'Cible donnee hors carte native');
+     W:=NativeMapAddress(V,1,TM)+T;
+    End;
+    End Else If R And $4000<>0 Then Begin
+    If (R And $1000<>0) And (T>NativeMapLength(V,0,TM)) Then Fail(72,'Cible code hors carte native');
+    W:=NativeMapAddress(V,0,TM)+T;
+    End Else W:=NativeProcAddress(V,TM)+T;
+    At:=At+Source;
+    If R And $1000<>0 Then Begin
+     WriteAt(At,W,InConst); Inc(At,2);
+    End Else If R And $2000=0 Then Begin
+     WriteAt(At,Word(Longint(W)-At-2),InConst);
    End;
    If R And $2000<>0 Then Begin
     WriteAt(At,0,InConst);
@@ -3732,10 +3927,14 @@ Begin
  End;
  For I:=1 To NativeRefCount Do Begin
   U:=NativeRefs[I].U;
+  If Not NativeActive[U] Then Fail(72,'Cible native non activee');
   If NativeRefs[I].Kind=3 Then Value:=NativeProcAddress(U,NativeRefs[I].Map)+
   NativeRefs[I].Target
-  Else Value:=NativeMapAddress(U,NativeRefs[I].Kind,NativeRefs[I].Map)+
-  NativeRefs[I].Target;
+  Else Begin
+   If NativeRefs[I].Target>=NativeMapLength(U,NativeRefs[I].Kind,NativeRefs[I].Map) Then
+    Fail(72,'Reference native hors carte de donnees');
+   Value:=NativeMapAddress(U,NativeRefs[I].Kind,NativeRefs[I].Map)+NativeRefs[I].Target;
+  End;
   PatchWord(NativeRefs[I].Position,Value);
  End;
  Sys:=FindBuildUnit('SYSTEM');
@@ -3779,6 +3978,8 @@ Begin
   If (NativeBuffers[U]<>Nil) And (Name<>'SYSTEM') Then        If (
   NativeHeaders[U].CodeMap-NativeHeaders[U].ProcMap>=8) And
   (NativeWord(U,NativeHeaders[U].ProcMap+4)<>$FFFF) Then Begin
+          If CurrentUnit<>0 Then
+           Units[CurrentUnit].NativeDependencies:=Units[CurrentUnit].NativeDependencies+[U];
    NativeNeeded:=True; ActivateNative(U);
   End;
  End;
@@ -4005,6 +4206,7 @@ Procedure Help;Begin
  WriteLn('/B reconstruit les unites depuis leurs sources (sous-ensemble Pascal).');
  WriteLn('Production/liaison TPU9 profil TPC1; ABI locale, pas ABI Borland.');
  WriteLn('TPU9/TPL Borland: appels far, parametres et globals ordinaux 8/16 bits.');
+  WriteLn('Ponts natifs sauvegardes en TPU v4; parametres shortstring Borland.');
  WriteLn('Signatures avancees, 8087 et overlays restent non implementes.');
  WriteLn('/M reconnu, refuse: reconstruction incrementale non implementee.');
  WriteLn('/Q silencieux; /T repertoires Turbo (TURBO.TPL et TPU).');
