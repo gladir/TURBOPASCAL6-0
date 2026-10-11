@@ -12,8 +12,9 @@ Program TPC;
   COMPILER.INC et LEX.ASM. Le parseur et le runtime sont nouveaux: le code
   produit n'est pas identique a celui de Borland. Aucun backend FPC externe.
   Hote valide: Free Pascal 3.2, mode TP, strings courts uniquement.
-  Cible: DOS MZ, instructions 8086, un segment CS/DS et pile separee.
-  Restrictions explicites: ABI Borland partielle (ordinaux 8/16 bits), pas d'OBJ, real, tableaux, objets,
+  Cible: DOS MZ multi-segments, instructions 8086, CS/DS local et pile separee.
+  Imports OMF86 Use16 via $L/$LINK; routines EXTERNAL Pascal far.
+  Restrictions explicites: ABI Borland partielle (ordinaux 8/16 bits), real, tableaux, objets,
   types structures, signatures structurees, ASM.
   Dictionnaire par unite/portee; types nommes ordinaux/chaine, constantes
   calculees et typees, frames locales et liens statiques pour procedures.
@@ -146,6 +147,11 @@ Const
  MaxScopes=128;
  MaxNativeParams = 8;
  MaxNativeRefs = 4096;
+ MaxObjects = 64;
+ MaxObjSegments = 256;
+ MaxObjNames = 512;
+ MaxObjGroups = 128;
+ MaxLinkedImage = 524288;
 
 Type
  TShortString = String[255];
@@ -260,6 +266,40 @@ Type
  TMZRelocation = Packed Record
   Offs, Segm: Word
  End;
+ TLinkedImage = Array[0..MaxLinkedImage-1] Of Byte;
+ PLinkedImage = ^TLinkedImage;
+ TObjectFile = Record
+  Path: TShortString;
+  Owner: Byte;
+  Bytes: PBinaryBuffer;
+  Length: Longint;
+ End;
+ TObjectSegment = Record
+  Name, ClassName: String[63];
+  Combine, Alignment: Byte;
+  Root: Word;
+  Length, Contribution, Base: Longint;
+  Bytes: PBinaryBuffer;
+ End;
+ TObjectGroup = Record
+  Name: String[63];
+  Members: Array[1..MaxObjSegments] Of Word;
+  Count: Word;
+  Base: Longint;
+ End;
+ TObjectPublic = Record
+  Name: String[63];
+  Segment, GroupIndex, Offset: Word;
+ End;
+ TObjectFixup = Record
+  Segment, Offset, FrameIndex, TargetIndex, Displacement: Word;
+  Location, FrameMethod, TargetMethod: Byte;
+  Relative: Boolean;
+ End;
+ TObjectCall = Record
+  Name: String[63];
+  Position: Word;
+ End;
  TSourceBuffer = Array[1..MaxSource] Of Char;
  PSourceBuffer = ^TSourceBuffer;
  PParserState = ^TParserState;
@@ -345,7 +385,24 @@ Var
  RuntimeUnsigned: Word;
  NativeInitOrder: Array[1..MaxUnits] Of Byte;
  NativeInitCount: Byte;
+ ObjectFiles: Array[1..MaxObjects] Of TObjectFile;
+ ObjectCount: Word;
+ ObjectSegments: Array[1..MaxObjSegments] Of TObjectSegment;
+ ObjectSegmentCount: Word;
+ ObjectGroups: Array[1..MaxObjGroups] Of TObjectGroup;
+ ObjectGroupCount: Word;
+ ObjectPublics: Array[1..MaxObjNames] Of TObjectPublic;
+ ObjectPublicCount: Word;
+ ObjectExternals: Array[1..MaxObjNames] Of String[63];
+ ObjectExternalCount: Word;
+ ObjectFixups: Array[1..MaxFixups] Of TObjectFixup;
+ ObjectFixupCount: Word;
+ ObjectCalls: Array[1..MaxSymbols] Of TObjectCall;
+ ObjectCallCount: Word;
+ LinkedImage: PLinkedImage;
+ LinkedSize: Longint;
 Procedure ActivateNative(U: Byte);Forward;
+ Procedure QueueObject(Name: TShortString);Forward;
 
 Function Upper(S: TShortString): TShortString;
 Var
@@ -583,6 +640,7 @@ Begin
  End Else If Active Then Begin
   If Cmd='DEFINE' Then Define(Arg) Else
   If Cmd='UNDEF' Then Undefine(Arg) Else
+  If (Cmd='L') Or (Cmd='LINK') Then QueueObject(Arg) Else
   If (Length(Cmd)=2) And (Cmd[2] In ['+','-']) Then SetSwitch(Cmd) Else
   If (Length(Cmd)>0) And (Cmd[1]='M') Then      MemoryDirective(Trim(Copy(S,2,255)))
                                       Else Unsupported('directive $'+S);
@@ -2088,7 +2146,7 @@ Procedure DeclarationPart; Forward;
 Procedure ProcedureDeclaration;
 Var
  I,Parent,FramePatch,Skip,J,K,T,V,ParamOffset,Size,Link: Word;
- SavedProcedure,IsFunction,Existing,FullHeading,ByVar,IsForward,HasDistance: Boolean;
+ SavedProcedure,IsFunction,Existing,FullHeading,ByVar,IsForward,HasDistance,IsExternal: Boolean;
  Sig: TSymbol; Name: TShortString;
  Names: Array[1..MaxNativeParams] Of String[63]; N: Byte;
 Begin
@@ -2145,16 +2203,18 @@ Begin
   End Else If Not Existing Then Need(tkColon);
  End;
  Need(tkSemi);
- IsForward:=False; HasDistance:=False;
+ IsForward:=False; HasDistance:=False; IsExternal:=False;
  Sig.FarRoutine:=InInterface Or (OptionBits And $20<>0);
- While (Token=tkIdent) And ((TokenText='FORWARD') Or (TokenText='NEAR') Or (TokenText='FAR')) Do Begin
+ While (Token=tkIdent) And ((TokenText='FORWARD') Or (TokenText='NEAR') Or (TokenText='FAR') Or (TokenText='EXTERNAL')) Do Begin
   If TokenText='FORWARD' Then IsForward:=True
+  Else If TokenText='EXTERNAL' Then IsExternal:=True
   Else Begin
    If HasDistance Then Fail(5,'Directive de distance dupliquee');
    HasDistance:=True; Sig.FarRoutine:=TokenText='FAR';
   End;
   NextToken; Need(tkSemi);
  End;
+ If IsExternal And IsForward Then Fail(5,'EXTERNAL et FORWARD incompatibles');
  If Existing Then Begin
   If IsFunction<>(Symbols[I].Typ<>ttVoid) Then Fail(130,'Procedure/fonction differente');
   If FullHeading Then Begin
@@ -2184,6 +2244,27 @@ Begin
  If InInterface Or IsForward Then Begin Symbols[I].ForwardDeclared:=True; Exit End;
  PatchJump(Symbols[I].ForwardJump,CodeSize);
  Symbols[I].HasBody:=True;
+ If IsExternal Then Begin
+  If CurrentScope<>0 Then Unsupported('EXTERNAL imbrique');
+  If ObjectCallCount=MaxSymbols Then Unsupported('trop de routines EXTERNAL');
+  { Pont ABI locale (lien statique) vers ABI Pascal OBJ far sans lien.
+    Copier les arguments afin que RETF n'enleve pas la frame du pont. }
+  Emit($55); Emit2($89,$E5); Emit($1E); Emit($06);
+  Emit($53); Emit($56); Emit($57);
+  Link:=4; If Symbols[I].FarRoutine Then Link:=6;
+  J:=Symbols[I].ParamBytes;
+  While J<>0 Do Begin
+   Emit2($FF,$B6); EmitWord(Link+J); Dec(J,2);
+  End;
+  Emit($9A); Inc(ObjectCallCount);
+  ObjectCalls[ObjectCallCount].Name:=Name;
+  ObjectCalls[ObjectCallCount].Position:=CodeSize;
+  EmitWord(0); EmitWord(0);
+  Emit($5F); Emit($5E); Emit($5B); Emit($07); Emit($1F); Emit($5D);
+  If Symbols[I].FarRoutine Then Emit($CA) Else Emit($C2);
+  EmitWord(Symbols[I].ParamBytes+2);
+  Exit;
+ End;
  Parent:=CurrentScope; SavedProcedure:=InProcedure;
  If ScopeCount=MaxScopes Then Unsupported('plus de 128 portees');
  Inc(ScopeCount); CurrentScope:=ScopeCount;
@@ -2374,9 +2455,310 @@ Function Align16(N: Longint): Longint;Begin
  Align16:=(N+15) And Not Longint(15)
 End;
 
-Function UnitFileSize(Var H: TUnitHeader): Longint;Begin
- UnitFileSize:=Align16(H.EndTrace)+Align16(H.CodeSize)+Align16(H.ConstSize)+
+Procedure QueueObject(Name: TShortString);
+Var D: DirStr; N: NameStr; E: ExtStr; Path: TShortString; I: Word;
+ F: File; Error: Integer; Count: Longint;
+Begin
+ Name:=Trim(Name);
+ If (Length(Name)>1) And (Name[1]='''') And (Name[Length(Name)]='''') Then
+  Name:=Copy(Name,2,Length(Name)-2);
+ If Name='' Then Fail(17,'Nom OBJ manquant');
+ FSplit(Name,D,N,E); If E='' Then Name:=Name+'.OBJ';
+ If D='' Then Path:=FindUnitPath(N,Copy(Name,Length(N)+1,255))
+ Else Begin
+  FSplit(SourceName,D,N,E); Path:=JoinPath(D,Name);
+  If Not FileExists(Path) Then Path:=Name;
+ End;
+ If Path='' Then Fail(15,'OBJ introuvable: '+Name);
+ Path:=FExpand(Path);
+ For I:=1 To ObjectCount Do
+  If (Upper(ObjectFiles[I].Path)=Upper(Path)) And
+     (ObjectFiles[I].Owner=CurrentUnit) Then Exit;
+ If ObjectCount=MaxObjects Then Unsupported('trop de fichiers OBJ');
+ Inc(ObjectCount); ObjectFiles[ObjectCount].Path:=Path;
+ ObjectFiles[ObjectCount].Owner:=CurrentUnit;
+ Assign(F,Path); OpenBinaryRead(F,Error);
+ If Error<>0 Then Fail(15,'OBJ introuvable: '+Path);
+ ObjectFiles[ObjectCount].Length:=FileSize(F);
+ If (ObjectFiles[ObjectCount].Length<4) Or
+    (ObjectFiles[ObjectCount].Length>SizeOf(TBinaryBuffer)) Then Fail(72,'Taille OBJ invalide');
+ New(ObjectFiles[ObjectCount].Bytes);
+ {$I-} BlockRead(F,ObjectFiles[ObjectCount].Bytes^,ObjectFiles[ObjectCount].Length,Count);
+ Error:=IOResult; Close(F); If IOResult<>0 Then Error:=1; {$I+}
+ If (Error<>0) Or (Count<>ObjectFiles[ObjectCount].Length) Then Fail(72,'Lecture OBJ impossible');
+End;
+
+{ OMF86 Use16. Les index du fichier sont traduits en index globaux lors
+  de la lecture; aucun pointeur hote ne figure dans les records disque. }
+Procedure ReadObject(Path: TShortString; B: PBinaryBuffer; FileLength: Longint);
+Var
+ P, Last, RecordEnd, Q: Longint;
+ RecType, Check, A, C, D, Loc, FD, FM, TM: Byte;
+ SegMap: Array[1..MaxObjSegments] Of Word;
+ GroupMap: Array[1..MaxObjGroups] Of Word;
+ ExtMap: Array[1..MaxObjNames] Of Word;
+ Names: Array[1..MaxObjNames] Of String[63];
+ SegCount, GroupCount, ExtCount, NameCount: Word;
+ S, G, X, Offs, L, I, TI, FI, Disp: Word;
+ LastSegment, LastOffset: Word; LastLength: Longint;
+ FrameMethods, TargetMethods: Array[0..3] Of Byte;
+ FrameIndices, TargetIndices: Array[0..3] Of Word;
+ FrameDefined, TargetDefined: Array[0..3] Of Boolean;
+ Name: TShortString; Started, Ended, Relative: Boolean;
+
+Function GetByte: Byte;
+Begin
+ If P>=Last Then Fail(72,'Record OBJ tronque: '+Path);
+ GetByte:=B^[P]; Inc(P);
+End;
+Function GetWord: Word;
+Var V: Word;
+Begin V:=GetByte; GetWord:=V+Word(GetByte)*256 End;
+Function GetIndex: Word;
+Var V: Word;
+Begin
+ V:=GetByte;
+ If V And $80<>0 Then V:=(V And $7F)*256+GetByte;
+ GetIndex:=V;
+End;
+Function GetName: TShortString;
+Var V,K: Word; T: TShortString;
+Begin
+ V:=GetByte; If V>63 Then Unsupported('nom OMF de plus de 63 caracteres');
+ T:=''; For K:=1 To V Do T:=T+Chr(GetByte);
+ If T='' Then Fail(72,'Nom OMF vide'); GetName:=Upper(T);
+End;
+Function SegmentIndex(V: Word): Word;
+Begin
+ If (V=0) Or (V>SegCount) Then Fail(72,'Index SEGDEF OBJ invalide');
+ SegmentIndex:=SegMap[V];
+End;
+Function GroupIndex(V: Word): Word;
+Begin
+ If (V=0) Or (V>GroupCount) Then Fail(72,'Index GRPDEF OBJ invalide');
+ GroupIndex:=GroupMap[V];
+End;
+Function NameIndex(V: Word): TShortString;
+Begin
+ If (V=0) Or (V>NameCount) Then Fail(72,'Index LNAMES OBJ invalide');
+ NameIndex:=Names[V];
+End;
+Function MethodIndex(Method: Byte; V: Word): Word;
+Begin
+ Case Method Of
+  0:MethodIndex:=SegmentIndex(V);
+  1:MethodIndex:=GroupIndex(V);
+  2:Begin
+   If (V=0) Or (V>ExtCount) Then Fail(72,'Index EXTDEF OBJ invalide');
+   MethodIndex:=ExtMap[V];
+  End;
+ Else Fail(72,'Methode de fixup OMF invalide'); MethodIndex:=0;
+ End;
+End;
+Procedure IteratedBlock(Depth: Word);
+Var RepeatCount, Blocks, K: Word; Start, Finish, Length: Longint;
+Begin
+ If Depth>16 Then Fail(72,'LIDATA trop imbrique');
+ RepeatCount:=GetWord; Blocks:=GetWord; Start:=LastLength;
+ If Blocks=0 Then Begin
+  K:=GetByte;
+  If Longint(LastOffset)+LastLength+K>ObjectSegments[LastSegment].Length Then
+   Fail(72,'LIDATA hors segment');
+  While K<>0 Do Begin
+   ObjectSegments[LastSegment].Bytes^[LastOffset+LastLength]:=GetByte;
+   Inc(LastLength); Dec(K);
+  End;
+ End Else For K:=1 To Blocks Do IteratedBlock(Depth+1);
+ Finish:=LastLength; Length:=Finish-Start;
+ If RepeatCount=0 Then LastLength:=Start
+ Else Begin
+  If Longint(LastOffset)+Start+Length*RepeatCount>ObjectSegments[LastSegment].Length Then
+   Fail(72,'Expansion LIDATA hors segment');
+  For K:=2 To RepeatCount Do Begin
+   Move(ObjectSegments[LastSegment].Bytes^[LastOffset+Start],
+        ObjectSegments[LastSegment].Bytes^[LastOffset+LastLength],Length);
+   Inc(LastLength,Length);
+  End;
+ End;
+End;
+Begin
+ SegCount:=0; GroupCount:=0; ExtCount:=0; NameCount:=0;
+ LastSegment:=0; LastOffset:=0; LastLength:=0; P:=0; Started:=False; Ended:=False;
+ FillChar(FrameDefined,SizeOf(FrameDefined),0);
+ FillChar(TargetDefined,SizeOf(TargetDefined),0);
+ While P<FileLength Do Begin
+  If Ended Then Fail(72,'Texte apres MODEND OBJ');
+  If P+3>FileLength Then Fail(72,'En-tete record OBJ tronque');
+  RecType:=B^[P]; L:=B^[P+1]+Word(B^[P+2])*256;
+  If (L=0) Or (P+3+L>FileLength) Then Fail(72,'Longueur record OBJ invalide');
+  RecordEnd:=P+3+L; Last:=RecordEnd-1;
+  Check:=0; For Q:=P To RecordEnd-1 Do Check:=Check+B^[Q];
+  If (B^[Last]<>0) And (Check<>0) Then Fail(72,'Checksum OBJ invalide');
+  Inc(P,3);
+  If Not Started And (RecType<>$80) Then Fail(72,'THEADR OBJ attendu');
+  If (RecType<>$9C) And (RecType<>$A0) And (RecType<>$A2) Then LastSegment:=0;
+  Case RecType Of
+   $80:Begin
+    If Started Then Fail(72,'THEADR OBJ duplique');
+    Name:=GetName; Started:=True;
+   End;
+   $88,$94: P:=Last; { commentaires et numeros de lignes }
+   $96:While P<Last Do Begin
+    If NameCount=MaxObjNames Then Unsupported('trop de LNAMES OBJ');
+    Inc(NameCount);
+    { Le nom overlay vide est autorise dans LNAMES. }
+    If B^[P]=0 Then Begin Names[NameCount]:=''; Inc(P) End
+    Else Names[NameCount]:=GetName;
+   End;
+   $98:Begin
+    If (SegCount=MaxObjSegments) Or (ObjectSegmentCount=MaxObjSegments) Then
+     Unsupported('trop de segments OBJ');
+    A:=GetByte; C:=(A Shr 2) And 7; D:=A Shr 5;
+    If (A And 1<>0) Or (D=0) Or (D>4) Or Not (C In [0,2,4,5,6,7]) Then
+     Unsupported('SEGDEF absolu/Use32/alignement/combinaison');
+    If C In [4,7] Then C:=2; { synonymes PUBLIC OMF86 }
+    L:=GetWord;
+    If (A And 2<>0) And (L<>0) Then Fail(72,'SEGDEF Big avec longueur non nulle');
+    Inc(ObjectSegmentCount); S:=ObjectSegmentCount;
+    FillChar(ObjectSegments[S],SizeOf(TObjectSegment),0);
+    ObjectSegments[S].Length:=L;
+    If A And 2<>0 Then ObjectSegments[S].Length:=65536;
+    X:=GetIndex; ObjectSegments[S].Name:=NameIndex(X);
+    X:=GetIndex; ObjectSegments[S].ClassName:=NameIndex(X);
+    X:=GetIndex; Name:=NameIndex(X);
+    If Name<>'' Then Unsupported('overlay OBJ');
+    ObjectSegments[S].Combine:=C; ObjectSegments[S].Alignment:=D;
+    ObjectSegments[S].Root:=S;
+    New(ObjectSegments[S].Bytes); FillChar(ObjectSegments[S].Bytes^,SizeOf(TBinaryBuffer),0);
+    Inc(SegCount); SegMap[SegCount]:=S;
+   End;
+   $9A:Begin
+    X:=GetIndex; Name:=NameIndex(X); G:=0;
+    For I:=1 To ObjectGroupCount Do If ObjectGroups[I].Name=Name Then G:=I;
+    If G=0 Then Begin
+     If ObjectGroupCount=MaxObjGroups Then Unsupported('trop de groupes OBJ');
+     Inc(ObjectGroupCount); G:=ObjectGroupCount;
+     FillChar(ObjectGroups[G],SizeOf(TObjectGroup),0); ObjectGroups[G].Name:=Name;
+    End;
+    If GroupCount=MaxObjGroups Then Unsupported('trop de GRPDEF OBJ');
+    Inc(GroupCount); GroupMap[GroupCount]:=G;
+    While P<Last Do Begin
+     If GetByte<>$FF Then Unsupported('composant GRPDEF non segment');
+     X:=GetIndex; S:=SegmentIndex(X);
+     If ObjectGroups[G].Count=MaxObjSegments Then Unsupported('groupe OBJ trop grand');
+     Inc(ObjectGroups[G].Count); ObjectGroups[G].Members[ObjectGroups[G].Count]:=S;
+    End;
+   End;
+   $8C:While P<Last Do Begin
+    Name:=GetName; X:=GetIndex;
+    If (ExtCount=MaxObjNames) Or (ObjectExternalCount=MaxObjNames) Then
+     Unsupported('trop de EXTDEF OBJ');
+    Inc(ObjectExternalCount); ObjectExternals[ObjectExternalCount]:=Name;
+    Inc(ExtCount); ExtMap[ExtCount]:=ObjectExternalCount;
+   End;
+   $90:Begin
+    X:=GetIndex; G:=0; If X<>0 Then G:=GroupIndex(X);
+    X:=GetIndex; S:=0; If X<>0 Then S:=SegmentIndex(X);
+    If S=0 Then Unsupported('PUBDEF absolu');
+    While P<Last Do Begin
+     Name:=GetName; Offs:=GetWord; X:=GetIndex;
+     If Offs>ObjectSegments[S].Length Then Fail(72,'PUBDEF hors segment');
+     For I:=1 To ObjectPublicCount Do If ObjectPublics[I].Name=Name Then
+      Fail(4,'PUBDEF OBJ duplique: '+Name);
+     If ObjectPublicCount=MaxObjNames Then Unsupported('trop de PUBDEF OBJ');
+     Inc(ObjectPublicCount);
+     ObjectPublics[ObjectPublicCount].Name:=Name;
+     ObjectPublics[ObjectPublicCount].Segment:=S;
+     ObjectPublics[ObjectPublicCount].GroupIndex:=G;
+     ObjectPublics[ObjectPublicCount].Offset:=Offs;
+    End;
+   End;
+   $A0,$A2:Begin
+    X:=GetIndex; LastSegment:=SegmentIndex(X); LastOffset:=GetWord;
+    LastLength:=0;
+    If LastOffset>ObjectSegments[LastSegment].Length Then Fail(72,'Donnees OBJ hors segment');
+    If RecType=$A0 Then Begin
+     If Longint(LastOffset)+Last-P>ObjectSegments[LastSegment].Length Then
+      Fail(72,'LEDATA hors segment');
+     LastLength:=Last-P;
+     Move(B^[P],ObjectSegments[LastSegment].Bytes^[LastOffset],LastLength); P:=Last;
+    End Else Begin
+     While P<Last Do IteratedBlock(0);
+     { FIXUPP sur LIDATA exige les offsets du flux encode; refuse clairement. }
+     LastSegment:=0;
+    End;
+   End;
+   $9C:While P<Last Do Begin
+    A:=GetByte;
+    If A And $80=0 Then Begin
+     I:=A And 3; FM:=(A Shr 2) And 7;
+     If A And $20<>0 Then Fail(72,'Bit reserve THREAD OBJ');
+     FI:=0;
+     If FM<3 Then Begin X:=GetIndex; FI:=MethodIndex(FM,X) End;
+     If A And $40<>0 Then Begin
+      If Not (FM In [0,1,2,4,5]) Then Unsupported('methode frame THREAD OBJ');
+      FrameMethods[I]:=FM; FrameIndices[I]:=FI; FrameDefined[I]:=True;
+     End Else Begin
+      If FM>2 Then Unsupported('methode target THREAD OBJ');
+      TargetMethods[I]:=FM; TargetIndices[I]:=FI; TargetDefined[I]:=True;
+     End;
+    End Else Begin
+     If LastSegment=0 Then Fail(72,'FIXUPP sans LEDATA');
+     Loc:=(A Shr 2) And 15; Relative:=A And $40=0;
+     Offs:=Word(A And 3)*256+GetByte;
+     If Not (Loc In [0,1,2,3,5]) Then Unsupported('location FIXUPP non 16 bits');
+     L:=2; If Loc=0 Then L:=1 Else If Loc=3 Then L:=4;
+     If Longint(Offs)+L>LastLength Then Fail(72,'FIXUPP hors LEDATA');
+     If Relative And Not (Loc In [0,1,5]) Then Fail(72,'FIXUPP relatif de segment');
+     FD:=GetByte; FM:=(FD Shr 4) And 7; FI:=0;
+     If FD And $80<>0 Then Begin
+      I:=FM And 3; If Not FrameDefined[I] Then Fail(72,'Thread frame OBJ indefini');
+      FM:=FrameMethods[I]; FI:=FrameIndices[I];
+     End Else If FM<3 Then Begin X:=GetIndex; FI:=MethodIndex(FM,X) End;
+     If Not (FM In [0,1,2,4,5]) Then Unsupported('methode frame FIXUPP');
+     TM:=FD And 3;
+     If FD And 8<>0 Then Begin
+      If Not TargetDefined[TM] Then Fail(72,'Thread target OBJ indefini');
+      TI:=TargetIndices[TM]; TM:=TargetMethods[TM];
+     End Else Begin
+      If TM=3 Then Unsupported('target absolu FIXUPP');
+      X:=GetIndex; TI:=MethodIndex(TM,X);
+     End;
+     Disp:=0; If FD And 4=0 Then Disp:=GetWord;
+     If ObjectFixupCount=MaxFixups Then Unsupported('trop de FIXUPP OBJ');
+     Inc(ObjectFixupCount);
+     With ObjectFixups[ObjectFixupCount] Do Begin
+      Segment:=LastSegment; Offset:=LastOffset+Offs; FrameIndex:=FI;
+      TargetIndex:=TI; Displacement:=Disp; Location:=Loc;
+      FrameMethod:=FM; TargetMethod:=TM;
+     End;
+     ObjectFixups[ObjectFixupCount].Relative:=Relative;
+    End;
+   End;
+   $8A:Begin
+    A:=GetByte; If A<>0 Then Unsupported('MODEND OBJ avec point d''entree');
+    Ended:=True;
+   End;
+  Else Begin Str(RecType,Name); Unsupported('record OMF '+Name) End;
+  End;
+  If P<>Last Then Fail(72,'Taille record OBJ incoherente');
+  P:=RecordEnd;
+ End;
+ If Not Ended Then Fail(72,'MODEND OBJ manquant');
+End;
+
+Function UnitFileSize(Var H: TUnitHeader): Longint;
+Var Size: Longint;
+Begin
+ Size:=Align16(H.EndTrace)+Align16(H.CodeSize)+Align16(H.ConstSize)+
  Align16(H.CodeFixupSize)+Align16(H.DataFixupSize);
+ If (H.Flags=$8000) And (H.Reserved[0]=$5054) And (H.Reserved[1]=$3143) And
+    (H.Reserved[2]>=5) Then Begin
+  If H.Reserved[9]>3 Then Fail(72,'Payload OBJ TPU trop grand');
+  Size:=Size+H.Reserved[8]+Longint(H.Reserved[9])*65536;
+  If Size>SizeOf(TBinaryBuffer) Then Fail(72,'TPU avec OBJ trop grande');
+ End;
+ UnitFileSize:=Size;
 End;
 
 Procedure ValidateUnitHeader(Name: TShortString; Limit: Longint; Var H: TUnitHeader);Begin
@@ -2752,6 +3134,7 @@ Begin
     est testee; une validation avec le linker Borland reste necessaire. }
  NativeConstants:=UnitOutput And (U=1) And
  Not Units[U].HasInit And (Units[U].Dependencies=[]);
+ For I:=1 To ObjectCount Do If ObjectFiles[I].Owner=U Then NativeConstants:=False;
  For I:=1 To SymbolCount Do If (Symbols[I].Owner=U) And
  (Symbols[I].Kind<>skConst) Then NativeConstants:=False;
  If Not NativeConstants Then
@@ -2883,6 +3266,18 @@ If Not NativeConstants Then Begin
    (CodeOwners[Relocations[I].Offs]=U) Then Begin
   PutWord(LocalOffset(Relocations[I].Offs,U,True)); PutWord(RelocationKinds[I]);
  End;
+ MetadataCount:=0;
+ For I:=1 To ObjectCount Do If ObjectFiles[I].Owner=U Then Inc(MetadataCount);
+ For I:=1 To ObjectCallCount Do If CodeOwners[ObjectCalls[I].Position]=U Then Inc(MetadataCount);
+ If MetadataCount<>0 Then Begin
+  H.Reserved[2]:=5; H.Reserved[7]:=Posn;
+  MetadataCount:=0;
+  For I:=1 To ObjectCallCount Do If CodeOwners[ObjectCalls[I].Position]=U Then Inc(MetadataCount);
+  PutWord(MetadataCount);
+  For I:=1 To ObjectCallCount Do If CodeOwners[ObjectCalls[I].Position]=U Then Begin
+   PutWord(LocalOffset(ObjectCalls[I].Position,U,True)); PutString(ObjectCalls[I].Name);
+  End;
+ End;
 End;
 If Odd(Posn) Then PutByte(0);
 If NativeConstants Then Begin
@@ -2974,7 +3369,28 @@ If Not NativeConstants Then
 For I:=0 To DataSize-1 Do If DataOwners[I]=U Then Begin
  B^[FilePos]:=Data[I]; Inc(FilePos)
 End;
-FilePos:=RelStart+Align16(FixLen); PayloadCheck:=0;
+FilePos:=RelStart+Align16(FixLen);
+If H.Reserved[2]=5 Then Begin
+ MetadataCount:=0;
+ For I:=1 To ObjectCount Do If ObjectFiles[I].Owner=U Then Inc(MetadataCount);
+ If FilePos+2>SizeOf(TBinaryBuffer) Then Unsupported('TPU avec OBJ trop grande');
+ B^[FilePos]:=MetadataCount And 255; B^[FilePos+1]:=MetadataCount Shr 8; Inc(FilePos,2);
+ For I:=1 To ObjectCount Do If ObjectFiles[I].Owner=U Then Begin
+  If FilePos+5+Length(ObjectFiles[I].Path)+ObjectFiles[I].Length>SizeOf(TBinaryBuffer) Then
+   Unsupported('TPU avec OBJ trop grande');
+  For J:=0 To 3 Do B^[FilePos+J]:=(ObjectFiles[I].Length Shr (J*8)) And 255;
+  Inc(FilePos,4); B^[FilePos]:=Length(ObjectFiles[I].Path); Inc(FilePos);
+  Move(ObjectFiles[I].Path[1],B^[FilePos],Length(ObjectFiles[I].Path));
+  Inc(FilePos,Length(ObjectFiles[I].Path));
+  Move(ObjectFiles[I].Bytes^,B^[FilePos],ObjectFiles[I].Length);
+  Inc(FilePos,ObjectFiles[I].Length);
+ End;
+ If Align16(FilePos)>SizeOf(TBinaryBuffer) Then Unsupported('TPU avec OBJ trop grande');
+ FilePos:=Align16(FilePos);
+ H.Reserved[8]:=Word(FilePos-RelStart-Align16(FixLen));
+ H.Reserved[9]:=(FilePos-RelStart-Align16(FixLen)) Shr 16;
+End;
+PayloadCheck:=0;
 For CodeStart:=80 To FilePos-1 Do    PayloadCheck:=((PayloadCheck Shl 1) Or (
 PayloadCheck Shr 15))+B^[CodeStart];
 If Not NativeConstants Then H.Reserved[4]:=PayloadCheck;
@@ -2986,7 +3402,7 @@ Assign(F,Path); {$I-} Rewrite(F,1); E:=IOResult; {$I+}
 If E<>0 Then Begin
  Dispose(B); Fail(16,'Creation TPU impossible: '+Path)
 End;
-FilePos:=RelStart+Align16(FixLen);
+FilePos:=UnitFileSize(H);
   {$I-} BlockWrite(F,B^,FilePos,Count); E:=IOResult; Close(F);
 If IOResult<>0 Then E:=1;
 If (E<>0) Or (Count<>FilePos) Then Begin
@@ -3265,7 +3681,7 @@ Begin
  Units[U].Checksum:=ReadWord(A+2);
  IsLocal:=(H.Flags=$8000) And (H.Reserved[0]=$5054) And (H.Reserved[1]=$3143);
  ProjectForeign:=Not IsLocal;
-  If IsLocal And Not (H.Reserved[2] In [1,2,3,4]) Then Fail(72,'Version du profil TPC1 inconnue');
+  If IsLocal And Not (H.Reserved[2] In [1,2,3,4,5]) Then Fail(72,'Version du profil TPC1 inconnue');
  If IsLocal Then Begin
   W:=0;
   For X:=80 To Size-1 Do W:=((W Shl 1) Or (W Shr 15))+B^[X];
@@ -3621,6 +4037,31 @@ Begin
    If (Longint(A)+2>H.CodeSize) Or (W>1) Then Fail(72,'Relocalisation native TPU invalide');
    AddSegmentRelocation(Units[U].CodeBase+A,W); PatchWord(Units[U].CodeBase+A,0);
   End;
+ End;
+ If IsLocal And (H.Reserved[2]>=5) Then Begin
+  X:=H.Reserved[7]; DictBounds(X,2); MetaCount:=ReadWord(X); Inc(X,2);
+  If MetaCount>MaxSymbols-ObjectCallCount Then Fail(72,'Trop de references OBJ TPU');
+  For K:=1 To MetaCount Do Begin
+   DictBounds(X,3); A:=ReadWord(X); Inc(X,2); Name:=ReadString(X);
+   If (Length(Name)=0) Or (Length(Name)>63) Or (Longint(A)+4>H.CodeSize) Then
+    Fail(72,'Reference OBJ TPU invalide');
+   DictBounds(X,Length(Name)+1); Inc(X,Length(Name)+1);
+   Inc(ObjectCallCount); ObjectCalls[ObjectCallCount].Name:=Upper(Name);
+   ObjectCalls[ObjectCallCount].Position:=Units[U].CodeBase+A;
+  End;
+  X:=Align16(H.EndTrace)+Align16(H.CodeSize)+Align16(H.ConstSize)+Align16(H.CodeFixupSize);
+  Bounds(X,2); MetaCount:=ReadWord(X); Inc(X,2);
+  If MetaCount>MaxObjects-ObjectCount Then Fail(72,'Trop de fichiers OBJ TPU');
+  For K:=1 To MetaCount Do Begin
+   Bounds(X,5); Value:=ReadWord(X)+Longint(ReadWord(X+2))*65536; Inc(X,4);
+   If (Value<4) Or (Value>SizeOf(TBinaryBuffer)) Then Fail(72,'Taille OBJ TPU invalide');
+   Name:=ReadString(X); Bounds(X,Length(Name)+1); Inc(X,Length(Name)+1);
+   Bounds(X,Value); Inc(ObjectCount); ObjectFiles[ObjectCount].Owner:=U;
+   ObjectFiles[ObjectCount].Path:=Name; ObjectFiles[ObjectCount].Length:=Value;
+   New(ObjectFiles[ObjectCount].Bytes);
+   Move(B^[X],ObjectFiles[ObjectCount].Bytes^,Value); Inc(X,Value);
+  End;
+  If (Align16(X)<>Size) Or (UnitFileSize(H)<>Size) Then Fail(72,'Payload OBJ TPU incoherent');
  End;
  Units[U].State:=2;
  If Units[U].HasInit Then Begin
@@ -4037,6 +4478,8 @@ Begin
  FillChar(Scopes,SizeOf(Scopes),0);
  RelativeCount:=0; UnitOutput:=False;
  NativeNeeded:=False; NativeRefCount:=0; RelocationCount:=0; NativeInitCount:=0;
+ ObjectCount:=0; ObjectCallCount:=0; ObjectSegmentCount:=0;
+ ObjectGroupCount:=0; ObjectPublicCount:=0; ObjectExternalCount:=0; ObjectFixupCount:=0;
  UnitCount:=0; InitCount:=0; CurrentUnit:=0; Imports:=[]; ImportCount:=0;
  InInterface:=False;
   InstallStandardTypes;
@@ -4093,11 +4536,210 @@ Begin
  SourcePos:=1; Line:=1; Column:=1; CondDepth:=0; Active:=True;
 End;
 
+Procedure LinkedWord(P: Longint; W: Word);
+Begin
+ If (P<0) Or (P+2>LinkedSize) Then Fail(72,'Fixup hors image liee');
+ LinkedImage^[P]:=W And 255; LinkedImage^[P+1]:=W Shr 8;
+End;
+
+Procedure LinkedRelocation(P: Longint);
+Var I: Word;
+Begin
+ If (P<0) Or (P+2>LinkedSize) Then Fail(72,'Relocalisation hors image liee');
+ For I:=1 To RelocationCount Do
+  If Longint(Relocations[I].Segm)*16+Relocations[I].Offs=P Then
+   Fail(72,'Relocalisation MZ dupliquee');
+ If RelocationCount=MaxNativeRefs Then Unsupported('trop de relocalisations MZ');
+ Inc(RelocationCount); Relocations[RelocationCount].Segm:=P Div 16;
+ Relocations[RelocationCount].Offs:=P Mod 16;
+End;
+
+Procedure LoadObjects;
+Var I,J: Word; Q: Longint; Duplicate: Boolean;
+Begin
+ For I:=1 To ObjectCount Do Begin
+  Duplicate:=False;
+  For J:=1 To I-1 Do If ObjectFiles[J].Length=ObjectFiles[I].Length Then Begin
+   Q:=0;
+   While (Q<ObjectFiles[I].Length) And
+     (ObjectFiles[J].Bytes^[Q]=ObjectFiles[I].Bytes^[Q]) Do Inc(Q);
+   If Q=ObjectFiles[I].Length Then Duplicate:=True;
+  End;
+  If Not Duplicate Then ReadObject(ObjectFiles[I].Path,ObjectFiles[I].Bytes,ObjectFiles[I].Length);
+ End;
+End;
+
+Procedure LinkObjects;
+Var
+ I,J,R,G,Pub: Word; P,T,Frame,Value,Addend,Width,Limit: Longint;
+ SegmentGroups: Array[1..MaxObjSegments] Of Word;
+ Placed: Array[1..MaxObjSegments] Of Boolean;
+ ExternalPublics: Array[1..MaxObjNames] Of Word;
+ F: TObjectFixup;
+
+Function Aligned(N: Longint; Alignment: Byte): Longint;
+Var A: Longint;
+Begin
+ A:=1;
+ Case Alignment Of 2:A:=2; 3:A:=16; 4:A:=256 End;
+ Aligned:=(N+A-1) And Not (A-1);
+End;
+Function FindPublic(Name: TShortString): Word;
+Var K: Word;
+Begin
+ FindPublic:=0;
+ For K:=1 To ObjectPublicCount Do If ObjectPublics[K].Name=Name Then Begin
+  FindPublic:=K; Exit;
+ End;
+ Fail(59,'Symbole OBJ non resolu: '+Name);
+End;
+Function PublicAddress(K: Word): Longint;
+Begin
+ PublicAddress:=ObjectSegments[ObjectPublics[K].Segment].Base+ObjectPublics[K].Offset;
+End;
+Function PublicFrame(K: Word): Longint;
+Var G,S: Word;
+Begin
+ G:=ObjectPublics[K].GroupIndex; S:=ObjectPublics[K].Segment;
+ If G<>0 Then PublicFrame:=ObjectGroups[G].Base
+ Else PublicFrame:=ObjectSegments[ObjectSegments[S].Root].Base And Not Longint(15);
+End;
+Function TargetAddress(Method: Byte; Index: Word): Longint;
+Begin
+ Case Method Of
+  0:TargetAddress:=ObjectSegments[Index].Base;
+  1:TargetAddress:=ObjectGroups[Index].Base;
+  2:TargetAddress:=PublicAddress(ExternalPublics[Index]);
+ Else Fail(72,'Methode target OBJ invalide'); TargetAddress:=0;
+ End;
+End;
+Function TargetFrame(Method: Byte; Index: Word): Longint;
+Begin
+ Case Method Of
+  0:TargetFrame:=ObjectSegments[ObjectSegments[Index].Root].Base And Not Longint(15);
+  1:TargetFrame:=ObjectGroups[Index].Base;
+  2:TargetFrame:=PublicFrame(ExternalPublics[Index]);
+ Else Fail(72,'Methode frame OBJ invalide'); TargetFrame:=0;
+ End;
+End;
+Procedure PlaceSegment(S: Word);
+Begin
+ If Placed[S] Then Exit;
+ LinkedSize:=Aligned(LinkedSize,ObjectSegments[S].Alignment);
+ { Hors groupe, donner une base en paragraphes. Dans un groupe, respecter
+   l'alignement declare sans introduire de trous supplementaires. }
+ If SegmentGroups[S]=0 Then LinkedSize:=Align16(LinkedSize);
+ ObjectSegments[S].Base:=LinkedSize;
+ Inc(LinkedSize,ObjectSegments[S].Length);
+ If LinkedSize>MaxLinkedImage Then Fail(49,'Image MZ multi-segments trop grande');
+ Placed[S]:=True;
+End;
+Begin
+ FillChar(SegmentGroups,SizeOf(SegmentGroups),0);
+ FillChar(Placed,SizeOf(Placed),0);
+ { PUBLIC/STACK concatene les contributions de meme nom et classe.
+   COMMON les superpose. PRIVATE conserve une identite propre. }
+ For I:=1 To ObjectSegmentCount Do Begin
+  R:=I;
+  If ObjectSegments[I].Combine<>0 Then
+   For J:=1 To I-1 Do
+    If (ObjectSegments[J].Root=J) And
+       (ObjectSegments[J].Combine<>0) And
+       (ObjectSegments[J].Name=ObjectSegments[I].Name) And
+       (ObjectSegments[J].ClassName=ObjectSegments[I].ClassName) Then Begin
+     If ObjectSegments[J].Combine<>ObjectSegments[I].Combine Then
+      Fail(72,'Combinaisons SEGDEF incompatibles');
+     R:=J; Break;
+    End;
+  ObjectSegments[I].Root:=R;
+  If R<>I Then Begin
+   If ObjectSegments[I].Combine=6 Then Begin
+    If ObjectSegments[I].Length>ObjectSegments[R].Length Then
+     ObjectSegments[R].Length:=ObjectSegments[I].Length;
+   End Else Begin
+    ObjectSegments[I].Contribution:=Aligned(ObjectSegments[R].Length,ObjectSegments[I].Alignment);
+    ObjectSegments[R].Length:=ObjectSegments[I].Contribution+ObjectSegments[I].Length;
+   End;
+   If ObjectSegments[I].Alignment>ObjectSegments[R].Alignment Then
+    ObjectSegments[R].Alignment:=ObjectSegments[I].Alignment;
+  End;
+  If ObjectSegments[R].Length>65536 Then Fail(48,'Segment OBJ combine > 64 Ko');
+ End;
+ For G:=1 To ObjectGroupCount Do
+  For J:=1 To ObjectGroups[G].Count Do Begin
+   R:=ObjectSegments[ObjectGroups[G].Members[J]].Root;
+   If (SegmentGroups[R]<>0) And (SegmentGroups[R]<>G) Then
+    Fail(72,'Segment OBJ dans plusieurs groupes');
+   SegmentGroups[R]:=G;
+  End;
+ For G:=1 To ObjectGroupCount Do Begin
+  LinkedSize:=Align16(LinkedSize); ObjectGroups[G].Base:=LinkedSize;
+  For J:=1 To ObjectGroups[G].Count Do PlaceSegment(ObjectSegments[ObjectGroups[G].Members[J]].Root);
+  If LinkedSize-ObjectGroups[G].Base>65536 Then Fail(49,'Groupe OBJ > 64 Ko');
+ End;
+ For I:=1 To ObjectSegmentCount Do If ObjectSegments[I].Root=I Then PlaceSegment(I);
+ For I:=1 To ObjectSegmentCount Do Begin
+  R:=ObjectSegments[I].Root;
+  If R<>I Then ObjectSegments[I].Base:=ObjectSegments[R].Base+ObjectSegments[I].Contribution;
+  { La longueur de la racine inclut des contributions suivantes, mais son
+    tampon ne contient que sa propre contribution. La copie suivante des
+    autres contributions remplit ces zones initialement nulles. }
+  Move(ObjectSegments[I].Bytes^,LinkedImage^[ObjectSegments[I].Base],ObjectSegments[I].Length);
+ End;
+ For I:=1 To ObjectPublicCount Do Begin
+  G:=ObjectPublics[I].GroupIndex;
+  If (G<>0) And (SegmentGroups[ObjectSegments[ObjectPublics[I].Segment].Root]<>G) Then
+   Fail(72,'PUBDEF hors GRPDEF');
+ End;
+ For I:=1 To ObjectExternalCount Do ExternalPublics[I]:=FindPublic(ObjectExternals[I]);
+ For I:=1 To ObjectCallCount Do Begin
+  Pub:=FindPublic(ObjectCalls[I].Name); P:=ObjectCalls[I].Position;
+  Frame:=PublicFrame(Pub); T:=PublicAddress(Pub)-Frame;
+  If (T<0) Or (T>65535) Then Fail(48,'Entree OBJ hors segment');
+  LinkedWord(P,T); LinkedWord(P+2,Frame Div 16); LinkedRelocation(P+2);
+ End;
+ For I:=1 To ObjectFixupCount Do Begin
+  F:=ObjectFixups[I]; P:=ObjectSegments[F.Segment].Base+F.Offset;
+  T:=TargetAddress(F.TargetMethod,F.TargetIndex)+F.Displacement;
+  Case F.FrameMethod Of
+   0,1,2:Frame:=TargetFrame(F.FrameMethod,F.FrameIndex);
+   4:Frame:=TargetFrame(0,F.Segment);
+   5:Frame:=TargetFrame(F.TargetMethod,F.TargetIndex);
+  Else Fail(72,'Frame OBJ invalide');
+  End;
+  Width:=2; If F.Location=0 Then Width:=1;
+  Addend:=LinkedImage^[P];
+  If Width=2 Then Addend:=Addend+Longint(LinkedImage^[P+1])*256;
+  If F.Relative Then Begin
+   { Une reference near doit rester dans le meme espace CS de 64 Ko. }
+   Limit:=TargetFrame(0,F.Segment);
+   If (T<Limit) Or (T>=Limit+65536) Then Fail(48,'FIXUPP near inter-segments');
+   If Width=1 Then Begin If Addend>=128 Then Dec(Addend,256) End
+   Else If Addend>=32768 Then Dec(Addend,65536);
+   Value:=T-P-Width+Addend;
+   If (Width=1) And ((Value<-128) Or (Value>127)) Then Fail(48,'FIXUPP relatif byte hors portee');
+  End Else Value:=T-Frame+Addend;
+  If F.Location<>2 Then Begin
+   If Not F.Relative And ((Value<0) Or (Value>65535)) Then Fail(49,'Offset FIXUPP hors frame');
+   If Width=1 Then LinkedImage^[P]:=Byte(Value) Else LinkedWord(P,Word(Value));
+  End;
+  If F.Location In [2,3] Then Begin
+   If F.Location=3 Then Inc(P,2);
+   Addend:=LinkedImage^[P]+Longint(LinkedImage^[P+1])*256;
+   Value:=Frame Div 16+Addend;
+   If Value>65535 Then Fail(49,'Segment FIXUPP trop grand');
+   LinkedWord(P,Value); LinkedRelocation(P);
+  End;
+ End;
+ For I:=1 To ObjectSegmentCount Do Dispose(ObjectSegments[I].Bytes);
+ For I:=1 To ObjectCount Do Dispose(ObjectFiles[I].Bytes);
+End;
+
 Procedure WriteExecutable;
 Var
  H: Array[0..15] Of Word;
  F: File;
- Size, AllocParas, HeaderBytes, Location: Longint;
+ Size, AllocParas, HeaderBytes, Location, Written, Chunk: Longint;
  I, Base, StackSeg, Pad, N: Word;
  E: Integer;
  Path: TShortString;
@@ -4110,23 +4752,25 @@ Begin
  Base:=CodeSize;
  If Longint(Base)+DataSize>65520 Then Fail(49,'CS/DS depasse 65520 octets');
  Size:=Longint(CodeSize)+DataSize;
- If Size>MaxImage Then Fail(49,'Image trop grande');
+ New(LinkedImage); FillChar(LinkedImage^,SizeOf(TLinkedImage),0);
  For I:=1 To FixupCount Do    PatchWord(Fixups[I].Position,Base+Fixups[I].DataOffset);
- For I:=0 To DataSize-1 Do Image[Base+I]:=Data[I];
+ Move(Image,LinkedImage^,CodeSize);
+ If DataSize<>0 Then Move(Data,LinkedImage^[Base],DataSize);
  NativeSegment:=0;
  If NativeNeeded Then Begin
   NativeSegment:=Align16(Size) Div 16;
   Size:=Longint(NativeSegment)*16+NativeDataSize;
-  If Size>MaxImage Then Fail(49,'Image Borland trop grande');
-  Move(NativeData,Image[Longint(NativeSegment)*16],NativeDataSize);
+  Move(NativeData,LinkedImage^[Longint(NativeSegment)*16],NativeDataSize);
+  LinkedSize:=Size;
   For I:=1 To RelocationCount Do Begin
    If Relocations[I].Segm=$FFFF Then Relocations[I].Segm:=NativeSegment;
    Location:=Longint(Relocations[I].Segm)*16+Relocations[I].Offs;
    If Location+2>Size Then Fail(72,'Relocalisation MZ hors image');
-   If RelocationKinds[I]=1 Then PatchWord(Location,NativeSegment)
-                           Else PatchWord(Location,0);
+   If RelocationKinds[I]=1 Then LinkedWord(Location,NativeSegment)
+                           Else LinkedWord(Location,0);
   End;
  End;
+ LinkedSize:=Size; LinkObjects; Size:=LinkedSize;
  StackSeg:=(Size+15) Div 16;
  Pad:=StackSeg*16-Size;
   { Pile non stockee dans le fichier: e_minalloc la reserve a la charge. }
@@ -4154,8 +4798,11 @@ Begin
  If (E=0) And (Pad<>0) Then Begin
   BlockWrite(F,Padding,Pad,N); E:=IOResult; If N<>Pad Then E:=1
  End;
- If E=0 Then Begin
-  BlockWrite(F,Image,Size,N); E:=IOResult; If N<>Size Then E:=1;
+ Written:=0;
+ While (E=0) And (Written<Size) Do Begin
+  Chunk:=Size-Written; If Chunk>32768 Then Chunk:=32768;
+  BlockWrite(F,LinkedImage^[Written],Chunk,N); E:=IOResult;
+  If N<>Chunk Then E:=1; Inc(Written,Chunk);
  End;
  Close(F); If IOResult<>0 Then E:=1;
  If E<>0 Then Begin
@@ -4163,6 +4810,7 @@ Begin
  End;
   {$I+}
  If E<>0 Then Fail(16,'Ecriture impossible: '+Path);
+ Dispose(LinkedImage);
  If Not Quiet Then WriteLn('8086 DOS MZ: ',Path,'; code=',CodeSize,
  ', donnees=',DataSize,', pile=',StackSize);
 End;
@@ -4207,6 +4855,8 @@ Procedure Help;Begin
  WriteLn('Production/liaison TPU9 profil TPC1; ABI locale, pas ABI Borland.');
  WriteLn('TPU9/TPL Borland: appels far, parametres et globals ordinaux 8/16 bits.');
   WriteLn('Ponts natifs sauvegardes en TPU v4; parametres shortstring Borland.');
+ WriteLn('MZ multi-segments; $L/$LINK OBJ OMF86 Use16, routines external Pascal far.');
+ WriteLn('TPU v5: OBJ embarques, liaison sans fichiers OBJ ni sources.');
  WriteLn('Signatures avancees, 8087 et overlays restent non implementes.');
  WriteLn('/M reconnu, refuse: reconstruction incrementale non implementee.');
  WriteLn('/Q silencieux; /T repertoires Turbo (TURBO.TPL et TPU).');
@@ -4341,7 +4991,7 @@ BEGIN
  Move(Defines,InitialDefines,SizeOf(Defines)); InitialDefineCount:=DefineCount;
  InitialOptions:=OptionBits;
  If Not Quiet Then WriteLn('TPC: portage partiel TP6; hote Pascal, cible DOS 8086');
- LoadSource; CompileProgram; WriteUnits;
+ LoadSource; CompileProgram; LoadObjects; WriteUnits;
  If Not UnitOutput Then Begin
   LinkNative; WriteExecutable
  End;
